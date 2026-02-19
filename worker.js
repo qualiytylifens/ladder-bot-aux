@@ -1,9 +1,9 @@
-// worker.js (ladder-bot-aux)
+// worker.js (CommonJS) - ladder-bot-aux
 // Minimal execution_jobs worker: claims jobs, heartbeats, finishes.
-// Node 18+ / 20+
+// Node 18/20+
 
-import 'dotenv/config';
-import { createClient } from '@supabase/supabase-js';
+require('dotenv').config();
+const { createClient } = require('@supabase/supabase-js');
 
 function mustEnv(name) {
   const v = process.env[name];
@@ -14,13 +14,7 @@ function mustEnv(name) {
 function parseWorkerTypes(raw) {
   const s = String(raw ?? '').trim();
   if (!s) return [];
-  // Accept:
-  //  - execute_intent
-  //  - execute_intent,other
-  //  - ["execute_intent"]
-  //  - {"execute_intent"}  (user asked about this)
-  //  - {execute_intent}
-  //  - "execute_intent"
+
   let x = s;
 
   // strip surrounding quotes
@@ -33,24 +27,19 @@ function parseWorkerTypes(raw) {
     try {
       const arr = JSON.parse(x);
       if (Array.isArray(arr)) return arr.map(String).map(t => t.trim()).filter(Boolean);
-    } catch (_) {
-      // fall through
-    }
+    } catch (_) {}
   }
 
   // Curly brace set-ish: {"execute_intent"} or {execute_intent}
   if (x.startsWith('{') && x.endsWith('}')) {
     x = x.slice(1, -1).trim();
-    // remove quotes inside
     x = x.replaceAll('"', '').replaceAll("'", '');
-    // split by comma
     return x.split(',').map(t => t.trim()).filter(Boolean);
   }
 
   // comma separated
   if (x.includes(',')) return x.split(',').map(t => t.trim()).filter(Boolean);
 
-  // single token
   return [x.trim()].filter(Boolean);
 }
 
@@ -79,16 +68,12 @@ async function rpc(name, args) {
 }
 
 async function claimJob() {
-  // There are 2 functions in your DB:
-  // - claim_execution_job(text)
-  // - claim_execution_job(text, text[])
-  // We will ALWAYS call the 2-arg version to avoid "not unique" errors.
+  // ALWAYS call the 2-arg overload to avoid "function is not unique"
   const data = await rpc('claim_execution_job', {
     p_worker_id: WORKER_ID,
     p_types: WORKER_TYPES,
   });
-  // expected: { claimed: {...} } or { claimed: null }
-  return data?.claimed ?? null;
+  return (data && data.claimed) ? data.claimed : null;
 }
 
 async function heartbeat(jobId, runId, step) {
@@ -109,19 +94,15 @@ async function finish(jobId, status, err) {
 }
 
 async function handleExecuteIntent(job) {
-  // Minimal: we only prove the pipeline works.
-  // Your real "execute" happens in ladder-bot — this worker just closes the job cleanly.
   const intentId = job?.payload?.intent_id;
   const symbol = job?.payload?.symbol;
   const action = job?.payload?.action;
 
-  // if any required field missing, fail fast so you see it
   if (!intentId || !symbol || !action) {
     throw new Error(`bad_payload: ${JSON.stringify(job?.payload ?? {})}`);
   }
 
-  // If you want this worker to call tv-controller or ladder-bot webhook later, we can add,
-  // but right now we keep it minimal & stable.
+  // Minimal "success" pipeline. Later we can call ladder-bot webhook or tv-controller.
   return { ok: true, intent_id: intentId, symbol, action };
 }
 
@@ -129,10 +110,8 @@ async function runOne(job) {
   const jobId = job.id;
   const runId = job.run_id;
 
-  // heartbeat right away
   await heartbeat(jobId, runId, 'claimed');
 
-  // keep heartbeating while we work
   let hbTimer = null;
   try {
     hbTimer = setInterval(() => {
@@ -147,7 +126,6 @@ async function runOne(job) {
       return;
     }
 
-    // unknown type
     await finish(jobId, 'failed', `unknown_type:${job.type}`);
     console.log('[FAIL]', { jobId, type: job.type, err: 'unknown_type' });
   } finally {
@@ -168,8 +146,7 @@ async function main() {
     HEARTBEAT_SECS,
   });
 
-  // main loop
-  // eslint-disable-next-line no-constant-condition
+  // loop forever
   while (true) {
     try {
       const job = await claimJob();
