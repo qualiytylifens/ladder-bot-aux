@@ -1,100 +1,62 @@
-// ladder-bot-aux execution worker
-// purpose: claim jobs from Supabase and keep them alive
+// worker.js (CommonJS)
+const { createClient } = require("@supabase/supabase-js");
 
-const { createClient } = require('@supabase/supabase-js');
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-
-const WORKER_ID = process.env.WORKER_ID || "ladder-worker-1";
-const WORKER_TYPES = (process.env.WORKER_TYPES || "execute_intent").split(",");
-const POLL_MS = Number(process.env.POLL_MS || 3000);
-const HEARTBEAT_SECS = Number(process.env.HEARTBEAT_SECS || 15);
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-  console.error("Missing Supabase credentials");
-  process.exit(1);
+function mustGet(name) {
+  const v = process.env[name];
+  if (!v || !String(v).trim()) throw new Error(`Missing env var: ${name}`);
+  return String(v).trim();
 }
 
-const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: { persistSession: false }
-});
+function parseTypes(raw) {
+  if (!raw) return ["execute_intent"];
 
-console.log("AUX WORKER STARTED", {
-  WORKER_ID,
-  TYPES: WORKER_TYPES
-});
+  const s = String(raw).trim();
 
-let activeJobs = new Map();
-
-/* -------------------------------------------------- */
-/* HEARTBEAT LOOP                                     */
-/* -------------------------------------------------- */
-setInterval(async () => {
-  for (const [jobId, job] of activeJobs.entries()) {
+  // Accept JSON arrays if someone pastes them (["execute_intent"])
+  if (s.startsWith("[") && s.endsWith("]")) {
     try {
-      await sb.rpc("heartbeat_execution_job", {
-        p_job_id: jobId,
-        p_worker_id: WORKER_ID,
-        p_run_id: job.run_id,
-        p_step: "alive"
-      });
-    } catch (err) {
-      console.error("heartbeat failed", jobId, err.message);
-    }
-  }
-}, HEARTBEAT_SECS * 1000);
-
-
-/* -------------------------------------------------- */
-/* CLAIM LOOP                                         */
-/* -------------------------------------------------- */
-async function poll() {
-  try {
-    const { data, error } = await sb.rpc("claim_execution_job", {
-      p_worker_id: WORKER_ID,
-      p_types: WORKER_TYPES
-    });
-
-    if (error) throw error;
-
-    if (data && data.id) {
-      console.log("CLAIMED JOB", data.id, data.payload);
-
-      activeJobs.set(data.id, data);
-
-      // simulate execution (your trading engine runs elsewhere)
-      setTimeout(() => finishJob(data.id), 4000);
-    }
-  } catch (err) {
-    console.error("poll error:", err.message);
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) return arr.map(String).map(x => x.trim()).filter(Boolean);
+    } catch (_) {}
   }
 
-  setTimeout(poll, POLL_MS);
+  // Accept comma-separated: execute_intent,other_type
+  return s
+    .split(",")
+    .map(x => x.trim())
+    .filter(Boolean);
 }
 
-
-/* -------------------------------------------------- */
-/* FINISH JOB                                         */
-/* -------------------------------------------------- */
-async function finishJob(jobId) {
-  const job = activeJobs.get(jobId);
-  if (!job) return;
-
-  try {
-    await sb.rpc("finish_execution_job", {
-      job_id: jobId,
-      new_status: "completed",
-      err: null
-    });
-
-    console.log("COMPLETED", jobId);
-  } catch (err) {
-    console.error("finish failed", jobId, err.message);
-  }
-
-  activeJobs.delete(jobId);
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
-/* start */
-poll();
+(async function main() {
+  const enabled = String(process.env.WORKER_ENABLED || "1").trim() === "1";
+  if (!enabled) {
+    console.log("[AUX] WORKER_DISABLED by env. Exiting.");
+    process.exit(0);
+  }
+
+  const SUPABASE_URL = mustGet("SUPABASE_URL");
+  const SUPABASE_SERVICE_KEY = mustGet("SUPABASE_SERVICE_KEY");
+
+  const WORKER_ID = String(process.env.WORKER_ID || "ladder-worker-1").trim();
+  const TYPES = parseTypes(process.env.WORKER_TYPES || "execute_intent");
+
+  const POLL_MS = Number(process.env.POLL_MS || "2000");
+  const HEARTBEAT_SECS = Number(process.env.HEARTBEAT_SECS || "20");
+
+  console.log("[AUX] WORKER STARTED", { WORKER_ID, TYPES, POLL_MS, HEARTBEAT_SECS });
+
+  const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    auth: { persistSession: false }
+  });
+
+  let hbTimer = null;
+
+  async function heartbeatLoop(jobId, runId) {
+    if (hbTimer) clearInterval(hbTimer);
+    hbTimer = setInterval(async () => {
+      try {
+        await
