@@ -1,17 +1,16 @@
 {
   "name": "ladder-bot-aux",
   "version": "1.0.0",
-  "description": "Execution job worker for Coin-Smart Supabase queue",
-  "private": true,
+  "description": "Coin-Smart execution worker (Supabase job runner)",
   "main": "worker.js",
   "type": "commonjs",
   "scripts": {
     "start": "node worker.js"
   },
-  "dependencies": {
-    "dotenv": "^16.4.5"
-  },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1"
   }
 }
