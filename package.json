@@ -1,0 +1,10 @@
+{
+  "name": "ladder-bot-aux",
+  "type": "module",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  },
+  "scripts": {
+    "start": "node worker.js"
+  }
+}
