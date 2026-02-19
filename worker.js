@@ -1,18 +1,63 @@
-/* worker.js - Ladder AUX Worker (CommonJS, Railway-friendly, no dotenv) */
+/**
+ * ladder-bot-aux / worker.js
+ * Minimal job worker:
+ * - claims jobs from Supabase via RPC claim_execution_job(worker_id, types[])
+ * - sends heartbeats via heartbeat_execution_job(job_id, worker_id, run_id, step)
+ * - executes job by POSTing to BOT_WEBHOOK_URL (optional)
+ * - finishes job via finish_execution_job(job_id, new_status, err)
+ *
+ * CommonJS (no "type": "module" needed).
+ */
 
-const { createClient } = require("@supabase/supabase-js");
-const crypto = require("crypto");
+const dotenv = require("dotenv");
+dotenv.config();
 
-// ---------- helpers ----------
-function nowIso() {
-  return new Date().toISOString();
+const WORKER_ENABLED = String(process.env.WORKER_ENABLED || "").toLowerCase() !== "0" &&
+  String(process.env.WORKER_ENABLED || "").toLowerCase() !== "false";
+
+const WORKER_ID = String(process.env.WORKER_ID || "ladder-worker-1");
+const SUPABASE_URL = String(process.env.SUPABASE_URL || "");
+const SUPABASE_SERVICE_KEY = String(process.env.SUPABASE_SERVICE_KEY || "");
+
+const BOT_WEBHOOK_URL = String(process.env.BOT_WEBHOOK_URL || ""); // optional but recommended
+const API_SECRET = String(process.env.API_SECRET || ""); // optional depending on ladder-bot auth
+
+const POLL_MS = Number(process.env.POLL_MS || 2000);
+const HEARTBEAT_SECS = Number(process.env.HEARTBEAT_SECS || 20);
+const JOB_TIMEOUT_MS = Number(process.env.JOB_TIMEOUT_MS || 60000);
+
+// WORKER_TYPES can be:
+// - execute_intent
+// - execute_intent,other_type
+// - ["execute_intent"]
+// - {"types":["execute_intent"]}  (we’ll accept common mistakes)
+function parseWorkerTypes(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return ["execute_intent"];
+
+  // JSON?
+  if (s.startsWith("{") || s.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(s);
+      if (Array.isArray(parsed)) return parsed.map(String);
+      if (parsed && Array.isArray(parsed.types)) return parsed.types.map(String);
+    } catch (e) {
+      // fall through
+    }
+  }
+
+  // CSV / single
+  return s.split(",").map(x => x.trim()).filter(Boolean);
 }
 
-function log(obj) {
-  try {
-    console.log(JSON.stringify(obj));
-  } catch {
-    console.log(String(obj));
+const WORKER_TYPES = parseWorkerTypes(process.env.WORKER_TYPES);
+
+function log(tag, obj) {
+  const ts = new Date().toISOString();
+  if (obj !== undefined) {
+    console.log(`[${tag}] ${ts}`, typeof obj === "string" ? obj : JSON.stringify(obj));
+  } else {
+    console.log(`[${tag}] ${ts}`);
   }
 }
 
@@ -20,222 +65,154 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function requiredEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`missing_env:${name}`);
-  return v;
-}
-
-function parseBool(v, def = false) {
-  if (v == null) return def;
-  const s = String(v).trim().toLowerCase();
-  return ["1", "true", "yes", "y", "on"].includes(s);
-}
-
-function parseIntSafe(v, def) {
-  const n = parseInt(String(v ?? ""), 10);
-  return Number.isFinite(n) ? n : def;
-}
-
-/**
- * WORKER_TYPES accepted forms:
- * - execute_intent
- * - execute_intent,other_type
- * - ["execute_intent"]
- * - {"types":["execute_intent"]}  (we’ll read .types if present)
- */
-function parseWorkerTypes(raw) {
-  const def = ["execute_intent"];
-  if (!raw) return def;
-
-  const s = String(raw).trim();
-
-  // JSON forms
-  if (s.startsWith("[") || s.startsWith("{")) {
-    try {
-      const parsed = JSON.parse(s);
-      if (Array.isArray(parsed)) return parsed.map(String);
-      if (parsed && Array.isArray(parsed.types)) return parsed.types.map(String);
-    } catch {
-      // fall through
-    }
+function requireEnv(name, value) {
+  if (!value) {
+    throw new Error(`Missing required env var: ${name}`);
   }
-
-  // comma separated or single
-  if (s.includes(",")) return s.split(",").map((x) => x.trim()).filter(Boolean);
-  return [s];
 }
 
-async function withTimeout(promise, ms, label) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`timeout:${label}:${ms}ms`)), ms)
-    ),
-  ]);
-}
+async function sbRpc(fnName, bodyObj) {
+  requireEnv("SUPABASE_URL", SUPABASE_URL);
+  requireEnv("SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY);
 
-// ---------- config ----------
-const SUPABASE_URL = requiredEnv("SUPABASE_URL");
-const SUPABASE_SERVICE_KEY = requiredEnv("SUPABASE_SERVICE_KEY");
-
-const WORKER_ENABLED = parseBool(process.env.WORKER_ENABLED, true);
-const WORKER_ID = (process.env.WORKER_ID || "ladder-worker-1").trim();
-const WORKER_TYPES = parseWorkerTypes(process.env.WORKER_TYPES);
-
-const POLL_MS = parseIntSafe(process.env.POLL_MS, 2000);
-const HEARTBEAT_SECS = parseIntSafe(process.env.HEARTBEAT_SECS, 20);
-
-// Optional: where to send the job to actually execute it
-// If you don’t set this, the job will FAIL with a clear reason.
-const BOT_WEBHOOK_URL = (process.env.BOT_WEBHOOK_URL || "").trim();
-// Optional: bearer token to protect your webhook endpoint
-const API_SECRET = (process.env.API_SECRET || "").trim();
-
-// Hard safety timeout per job (ms)
-const JOB_TIMEOUT_MS = parseIntSafe(process.env.JOB_TIMEOUT_MS, 60000); // 60s default
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: { persistSession: false },
-});
-
-// ---------- Supabase RPC wrappers ----------
-async function rpcClaim(workerId, types) {
-  // Uses claim_execution_job(text, text[]) (the more specific signature)
-  const { data, error } = await supabase.rpc("claim_execution_job", {
-    p_worker_id: workerId,
-    p_types: types,
-  });
-  if (error) throw error;
-  return data; // { claimed: {...} } or nullish
-}
-
-async function rpcHeartbeat(jobId, workerId, runId, step) {
-  const { error } = await supabase.rpc("heartbeat_execution_job", {
-    p_job_id: jobId,
-    p_worker_id: workerId,
-    p_run_id: runId,
-    p_step: step,
-  });
-  if (error) throw error;
-}
-
-async function rpcFinish(jobId, newStatus, err) {
-  const { error } = await supabase.rpc("finish_execution_job", {
-    job_id: jobId,
-    new_status: newStatus,
-    err: err,
-  });
-  if (error) throw error;
-}
-
-// ---------- executor ----------
-async function executeJob(job) {
-  const jobId = job.id;
-  const jobType = job.type;
-  const payload = job.payload || {};
-  const runId = job.run_id || crypto.randomUUID();
-
-  // Step progression: you will SEE this in Supabase now
-  await rpcHeartbeat(jobId, WORKER_ID, runId, "execute_start");
-
-  // Keep heartbeat alive while executing
-  let hbTimer = null;
-  let hbStep = "executing";
-  try {
-    hbTimer = setInterval(() => {
-      rpcHeartbeat(jobId, WORKER_ID, runId, hbStep).catch(() => {});
-    }, HEARTBEAT_SECS * 1000);
-
-    // Only one supported type right now
-    if (jobType !== "execute_intent") {
-      throw new Error(`unsupported_type:${jobType}`);
-    }
-
-    // Require webhook URL so we can actually do the action
-    if (!BOT_WEBHOOK_URL) {
-      throw new Error("missing_env:BOT_WEBHOOK_URL");
-    }
-
-    // Send to your bot/executor service
-    // Payload example you already have:
-    // { action: "buy", symbol: "XRPC", intent_id: "uuid" }
-    hbStep = "sending_webhook";
-
-    const headers = {
+  const url = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/rpc/${fnName}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "apikey": SUPABASE_SERVICE_KEY,
+      "authorization": `Bearer ${SUPABASE_SERVICE_KEY}`,
       "content-type": "application/json",
-    };
-    if (API_SECRET) headers["authorization"] = `Bearer ${API_SECRET}`;
+    },
+    body: JSON.stringify(bodyObj || {}),
+  });
 
-    const body = {
-      type: jobType,
-      job_id: jobId,
-      run_id: runId,
-      worker_id: WORKER_ID,
-      payload,
-    };
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch (_) {}
 
-    const res = await withTimeout(
-      fetch(BOT_WEBHOOK_URL, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      }),
-      JOB_TIMEOUT_MS,
-      "webhook"
-    );
+  if (!res.ok) {
+    const msg = `Supabase RPC ${fnName} failed: ${res.status} ${res.statusText} :: ${text}`;
+    throw new Error(msg);
+  }
+  return json;
+}
 
-    hbStep = "webhook_response";
+async function claimJob() {
+  // Uses claim_execution_job(text,text[]) returning jsonb
+  const claimed = await sbRpc("claim_execution_job", {
+    p_worker_id: WORKER_ID,
+    p_types: WORKER_TYPES,
+  });
 
-    const text = await res.text().catch(() => "");
-    if (!res.ok) {
-      throw new Error(`webhook_http_${res.status}:${text.slice(0, 200)}`);
-    }
+  // Expected shape:
+  // { claimed: { id, type, run_id, payload: { ... } } }
+  // Or sometimes null/{} if no jobs
+  if (!claimed || !claimed.claimed || !claimed.claimed.id) return null;
+  return claimed.claimed;
+}
 
-    hbStep = "execute_done";
-    await rpcHeartbeat(jobId, WORKER_ID, runId, "execute_done");
-
-    // Mark completed
-    await rpcFinish(jobId, "completed", null);
-
-    log({
-      tag: "AUX",
-      msg: "JOB_COMPLETED",
-      ts: nowIso(),
-      job_id: jobId,
-      type: jobType,
-      run_id: runId,
-      payload,
+async function heartbeat(jobId, runId, step) {
+  // heartbeat_execution_job(p_job_id uuid, p_worker_id text, p_run_id uuid, p_step text)
+  try {
+    await sbRpc("heartbeat_execution_job", {
+      p_job_id: jobId,
+      p_worker_id: WORKER_ID,
+      p_run_id: runId,
+      p_step: step || "running",
     });
   } catch (e) {
-    const errMsg = e && e.message ? e.message : String(e);
-    try {
-      await rpcHeartbeat(jobId, WORKER_ID, runId, "execute_failed");
-    } catch {}
-    try {
-      await rpcFinish(jobId, "failed", errMsg);
-    } catch {}
+    // Don't crash worker on heartbeat errors; log and continue.
+    log("HB_ERR", { jobId, err: String(e.message || e) });
+  }
+}
 
-    log({
-      tag: "AUX",
-      msg: "JOB_FAILED",
-      ts: nowIso(),
-      job_id: jobId,
-      type: jobType,
-      run_id: runId,
-      error: errMsg,
+async function finish(jobId, newStatus, errText) {
+  // finish_execution_job(job_id uuid, new_status text, err text)
+  await sbRpc("finish_execution_job", {
+    job_id: jobId,
+    new_status: newStatus,
+    err: errText || null,
+  });
+}
+
+async function callWebhook(job) {
+  if (!BOT_WEBHOOK_URL) {
+    throw new Error("BOT_WEBHOOK_URL is not set (worker has nothing to execute)");
+  }
+
+  // You can change the path if your ladder-bot expects another endpoint.
+  // Keep it minimal + explicit.
+  const target = BOT_WEBHOOK_URL.replace(/\/$/, "");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), JOB_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(target, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(API_SECRET ? { "x-api-secret": API_SECRET } : {}),
+      },
+      body: JSON.stringify({
+        type: job.type,
+        job_id: job.id,
+        run_id: job.run_id,
+        payload: job.payload,
+      }),
+      signal: controller.signal,
     });
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`WEBHOOK ${res.status} ${res.statusText} :: ${text}`);
+    }
+    return { ok: true, body: text };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function processJob(job) {
+  // Heartbeat timer while job is processing
+  let hbTimer = null;
+  const hbEveryMs = Math.max(5, HEARTBEAT_SECS) * 1000;
+
+  try {
+    log("JOB_CLAIMED", { id: job.id, type: job.type, run_id: job.run_id, payload: job.payload });
+
+    // immediate heartbeat
+    await heartbeat(job.id, job.run_id, "claimed");
+
+    hbTimer = setInterval(() => {
+      heartbeat(job.id, job.run_id, "processing").catch(() => {});
+    }, hbEveryMs);
+
+    // Execute job (webhook)
+    log("JOB_EXEC", { id: job.id, target: BOT_WEBHOOK_URL ? "webhook" : "none" });
+    const out = await callWebhook(job);
+    log("JOB_EXEC_OK", { id: job.id, out });
+
+    await heartbeat(job.id, job.run_id, "finish_ok");
+    await finish(job.id, "completed", null);
+
+    log("JOB_DONE", { id: job.id, status: "completed" });
+  } catch (e) {
+    const errText = String(e && e.message ? e.message : e);
+    log("JOB_FAIL", { id: job.id, err: errText });
+
+    try { await heartbeat(job.id, job.run_id, "finish_failed"); } catch (_) {}
+    try { await finish(job.id, "failed", errText.slice(0, 900)); } catch (_) {}
+
+    log("JOB_DONE", { id: job.id, status: "failed" });
   } finally {
     if (hbTimer) clearInterval(hbTimer);
   }
 }
 
-// ---------- main loop ----------
 async function main() {
-  log({
+  log("WORKER_STARTED", {
     tag: "AUX",
-    msg: "WORKER_STARTED",
-    ts: nowIso(),
     WORKER_ENABLED,
     WORKER_ID,
     TYPES: WORKER_TYPES,
@@ -246,57 +223,34 @@ async function main() {
   });
 
   if (!WORKER_ENABLED) {
-    log({ tag: "AUX", msg: "WORKER_DISABLED_BY_ENV", ts: nowIso() });
-    return;
+    log("DISABLED", "WORKER_ENABLED is false/0. Exiting.");
+    process.exit(0);
   }
+
+  // Validate critical envs early so Railway logs show it
+  requireEnv("SUPABASE_URL", SUPABASE_URL);
+  requireEnv("SUPABASE_SERVICE_KEY", SUPABASE_SERVICE_KEY);
 
   while (true) {
     try {
-      // Claim 1 job at a time
-      const claimedWrap = await rpcClaim(WORKER_ID, WORKER_TYPES);
-      const claimed = claimedWrap && claimedWrap.claimed ? claimedWrap.claimed : null;
-
-      if (!claimed) {
+      log("POLL", { types: WORKER_TYPES });
+      const job = await claimJob();
+      if (!job) {
+        // no jobs
         await sleep(POLL_MS);
         continue;
       }
-
-      const jobId = claimed.id;
-      const runId = claimed.run_id || crypto.randomUUID();
-
-      // Immediately heartbeat with a clear step (not just "claimed")
-      await rpcHeartbeat(jobId, WORKER_ID, runId, "claimed_ok");
-
-      log({
-        tag: "AUX",
-        msg: "JOB_CLAIMED",
-        ts: nowIso(),
-        job_id: jobId,
-        type: claimed.type,
-        run_id: runId,
-        payload: claimed.payload || {},
-      });
-
-      // Execute (with real step progression + timeout)
-      await executeJob({
-        id: jobId,
-        type: claimed.type,
-        run_id: runId,
-        payload: claimed.payload || {},
-      });
-
-      // small breather
+      await processJob(job);
+      // small yield
       await sleep(250);
     } catch (e) {
-      const errMsg = e && e.message ? e.message : String(e);
-      log({ tag: "AUX", msg: "LOOP_ERROR", ts: nowIso(), error: errMsg });
-      await sleep(Math.max(POLL_MS, 2000));
+      log("LOOP_ERR", { err: String(e.message || e) });
+      await sleep(Math.max(1000, POLL_MS));
     }
   }
 }
 
 main().catch((e) => {
-  const errMsg = e && e.message ? e.message : String(e);
-  log({ tag: "AUX", msg: "FATAL", ts: nowIso(), error: errMsg });
+  log("FATAL", { err: String(e.message || e) });
   process.exit(1);
 });
