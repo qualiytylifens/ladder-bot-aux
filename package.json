@@ -1,16 +1,16 @@
 {
   "name": "ladder-bot-aux",
   "version": "1.0.0",
-  "description": "Execution worker for Coin-Smart Trader — claims Supabase execution_jobs and keeps them alive",
+  "private": true,
+  "description": "Aux worker to process execution_jobs from Supabase",
   "main": "worker.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node worker.js"
   },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1"
+  },
   "engines": {
     "node": ">=20"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.39.0"
   }
 }
