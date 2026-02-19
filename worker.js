@@ -1,170 +1,269 @@
-// worker.js (CommonJS) - ladder-bot-aux
-// Minimal execution_jobs worker: claims jobs, heartbeats, finishes.
-// Node 18/20+
+// worker.js (CommonJS) — ladder-bot-aux
+// Minimal Supabase-backed worker for execution_jobs.
+// - Claims jobs via public.claim_execution_job(...)
+// - Heartbeats via public.heartbeat_execution_job(...)
+// - Executes "execute_intent" jobs by attempting a few RPCs (safe: no direct table writes here)
+// - Finishes via public.finish_execution_job(...)
+//
+// REQUIRED ENVs (Railway provides them at runtime; no dotenv needed):
+//   SUPABASE_URL
+//   SUPABASE_SERVICE_KEY
+//   WORKER_ENABLED=1
+//   WORKER_ID=ladder-worker-1
+//   WORKER_TYPES=execute_intent   (or JSON array like ["execute_intent"] or set-like {"execute_intent"})
+// Optional:
+//   POLL_MS=2000
+//   HEARTBEAT_SECS=20
+//   CLAIM_TYPES_MODE=auto | single | typed   (default auto)
 
-require('dotenv').config();
-const { createClient } = require('@supabase/supabase-js');
+const { createClient } = require("@supabase/supabase-js");
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function mustEnv(name) {
   const v = process.env[name];
-  if (!v || String(v).trim() === '') throw new Error(`Missing env: ${name}`);
+  if (!v || String(v).trim() === "") throw new Error(`Missing required env var: ${name}`);
   return v;
 }
 
 function parseWorkerTypes(raw) {
-  const s = String(raw ?? '').trim();
+  const s = (raw || "").trim();
   if (!s) return [];
 
-  let x = s;
-
-  // strip surrounding quotes
-  if ((x.startsWith('"') && x.endsWith('"')) || (x.startsWith("'") && x.endsWith("'"))) {
-    x = x.slice(1, -1);
-  }
-
-  // JSON array
-  if (x.startsWith('[') && x.endsWith(']')) {
+  // JSON array: ["execute_intent","other"]
+  if (s.startsWith("[")) {
     try {
-      const arr = JSON.parse(x);
-      if (Array.isArray(arr)) return arr.map(String).map(t => t.trim()).filter(Boolean);
+      const arr = JSON.parse(s);
+      if (Array.isArray(arr)) return arr.map(String).map((x) => x.trim()).filter(Boolean);
     } catch (_) {}
   }
 
-  // Curly brace set-ish: {"execute_intent"} or {execute_intent}
-  if (x.startsWith('{') && x.endsWith('}')) {
-    x = x.slice(1, -1).trim();
-    x = x.replaceAll('"', '').replaceAll("'", '');
-    return x.split(',').map(t => t.trim()).filter(Boolean);
+  // set-ish: {"execute_intent"} or {execute_intent}
+  if (s.startsWith("{") && s.endsWith("}")) {
+    const inner = s.slice(1, -1).trim();
+    if (!inner) return [];
+    return inner
+      .split(",")
+      .map((x) => x.replace(/['"]/g, "").trim())
+      .filter(Boolean);
   }
 
-  // comma separated
-  if (x.includes(',')) return x.split(',').map(t => t.trim()).filter(Boolean);
-
-  return [x.trim()].filter(Boolean);
+  // single or csv: execute_intent or execute_intent,other
+  return s
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean);
 }
 
-const SUPABASE_URL = mustEnv('SUPABASE_URL');
-const SUPABASE_SERVICE_KEY = mustEnv('SUPABASE_SERVICE_KEY');
-
-const WORKER_ENABLED = String(process.env.WORKER_ENABLED ?? '1').trim() !== '0';
-const WORKER_ID = String(process.env.WORKER_ID ?? 'ladder-worker-1').trim();
-const WORKER_TYPES = parseWorkerTypes(process.env.WORKER_TYPES ?? 'execute_intent');
-
-const POLL_MS = Number(process.env.POLL_MS ?? 2000);
-const HEARTBEAT_SECS = Number(process.env.HEARTBEAT_SECS ?? 20);
-
-const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+function nowIso() {
+  return new Date().toISOString();
 }
 
-async function rpc(name, args) {
-  const { data, error } = await sb.rpc(name, args);
-  if (error) throw error;
+async function rpcOrThrow(sb, fn, args) {
+  const { data, error } = await sb.rpc(fn, args);
+  if (error) {
+    const msg = `[RPC:${fn}] ${error.message || error.toString()}`;
+    const e = new Error(msg);
+    e._sb = error;
+    throw e;
+  }
   return data;
 }
 
-async function claimJob() {
-  // ALWAYS call the 2-arg overload to avoid "function is not unique"
-  const data = await rpc('claim_execution_job', {
-    p_worker_id: WORKER_ID,
-    p_types: WORKER_TYPES,
-  });
-  return (data && data.claimed) ? data.claimed : null;
+async function safeHeartbeat(sb, jobId, workerId, runId, step) {
+  try {
+    await rpcOrThrow(sb, "heartbeat_execution_job", {
+      p_job_id: jobId,
+      p_worker_id: workerId,
+      p_run_id: runId,
+      p_step: step || null,
+    });
+  } catch (e) {
+    // Heartbeat failures should not crash the worker loop
+    console.log(`${nowIso()} [heartbeat] failed: ${e.message}`);
+  }
 }
 
-async function heartbeat(jobId, runId, step) {
-  await rpc('heartbeat_execution_job', {
-    p_job_id: jobId,
-    p_worker_id: WORKER_ID,
-    p_run_id: runId,
-    p_step: step,
-  });
-}
-
-async function finish(jobId, status, err) {
-  await rpc('finish_execution_job', {
+async function finishJob(sb, jobId, status, err) {
+  // finish_execution_job(job_id uuid, new_status text, err text) returns void
+  await rpcOrThrow(sb, "finish_execution_job", {
     job_id: jobId,
     new_status: status,
-    err: err ?? null,
+    err: err || null,
   });
 }
 
-async function handleExecuteIntent(job) {
-  const intentId = job?.payload?.intent_id;
-  const symbol = job?.payload?.symbol;
-  const action = job?.payload?.action;
+async function claimJob(sb, workerId, types) {
+  // Two overloads exist:
+  // - claim_execution_job(text) -> jsonb
+  // - claim_execution_job(text, text[]) -> jsonb
+  //
+  // We'll prefer typed claim when types are provided.
+  const mode = (process.env.CLAIM_TYPES_MODE || "auto").toLowerCase();
 
-  if (!intentId || !symbol || !action) {
-    throw new Error(`bad_payload: ${JSON.stringify(job?.payload ?? {})}`);
+  if (types && types.length > 0 && (mode === "auto" || mode === "typed")) {
+    const data = await rpcOrThrow(sb, "claim_execution_job", {
+      p_worker_id: workerId,
+      p_types: types,
+    });
+    return data;
   }
 
-  // Minimal "success" pipeline. Later we can call ladder-bot webhook or tv-controller.
-  return { ok: true, intent_id: intentId, symbol, action };
+  if (mode === "single" || mode === "auto") {
+    const data = await rpcOrThrow(sb, "claim_execution_job", {
+      p_worker_id: workerId,
+    });
+    return data;
+  }
+
+  // fallback
+  const data = await rpcOrThrow(sb, "claim_execution_job", {
+    p_worker_id: workerId,
+  });
+  return data;
 }
 
-async function runOne(job) {
-  const jobId = job.id;
-  const runId = job.run_id;
+async function executeIntentJob(sb, claimed) {
+  // claimed looks like:
+  // { id, type, run_id, payload: { action, symbol, intent_id } }
+  const jobId = claimed.id;
+  const runId = claimed.run_id;
+  const payload = claimed.payload || {};
+  const intentId = payload.intent_id;
 
-  await heartbeat(jobId, runId, 'claimed');
-
-  let hbTimer = null;
-  try {
-    hbTimer = setInterval(() => {
-      heartbeat(jobId, runId, 'working').catch(() => {});
-    }, Math.max(5, HEARTBEAT_SECS) * 1000);
-
-    if (job.type === 'execute_intent') {
-      const res = await handleExecuteIntent(job);
-      await heartbeat(jobId, runId, 'done');
-      await finish(jobId, 'completed', null);
-      console.log('[DONE]', { jobId, type: job.type, res });
-      return;
-    }
-
-    await finish(jobId, 'failed', `unknown_type:${job.type}`);
-    console.log('[FAIL]', { jobId, type: job.type, err: 'unknown_type' });
-  } finally {
-    if (hbTimer) clearInterval(hbTimer);
+  if (!intentId) {
+    throw new Error("execute_intent job payload missing intent_id");
   }
+
+  // ✅ SAFEST PATH:
+  // Attempt existing RPC(s) that YOUR schema might already have.
+  // If none exist, we fail the job with a clear error (no table writes here).
+  //
+  // Add your real executor RPC name here when you decide it:
+  // e.g. "execute_intent_worker" or "process_execute_intent"
+  const candidates = [
+    // Most likely names (you can keep/adjust):
+    { fn: "execute_intent_worker", args: { p_intent_id: intentId, p_run_id: runId, p_worker_id: process.env.WORKER_ID } },
+    { fn: "process_execute_intent", args: { p_intent_id: intentId, p_run_id: runId, p_worker_id: process.env.WORKER_ID } },
+    { fn: "execute_intent", args: { p_intent_id: intentId, p_run_id: runId, p_worker_id: process.env.WORKER_ID } },
+
+    // Generic fallback signature:
+    { fn: "execute_intent", args: { intent_id: intentId, run_id: runId, worker_id: process.env.WORKER_ID } },
+  ];
+
+  let lastErr = null;
+
+  for (const c of candidates) {
+    try {
+      await safeHeartbeat(sb, jobId, process.env.WORKER_ID, runId, `exec_try:${c.fn}`);
+      await rpcOrThrow(sb, c.fn, c.args);
+      await safeHeartbeat(sb, jobId, process.env.WORKER_ID, runId, `exec_ok:${c.fn}`);
+      return { ok: true, fn: c.fn };
+    } catch (e) {
+      lastErr = e;
+      const msg = e.message || String(e);
+      // If function doesn't exist, try next candidate.
+      // Postgres error for missing function often includes "does not exist".
+      const missing = /does not exist|undefined function|42883/i.test(msg);
+      console.log(`${nowIso()} [execute_intent] ${c.fn} failed: ${msg}`);
+      if (!missing) break; // other errors: stop and surface it
+    }
+  }
+
+  throw lastErr || new Error("execute_intent failed (no executor RPC found)");
 }
 
 async function main() {
-  if (!WORKER_ENABLED) {
-    console.log('[AUX] WORKER_DISABLED by env');
+  const enabled = String(process.env.WORKER_ENABLED || "1").trim();
+  if (enabled === "0" || enabled.toLowerCase() === "false") {
+    console.log(`${nowIso()} [AUX] WORKER_DISABLED by env WORKER_ENABLED=${enabled}`);
     process.exit(0);
   }
 
-  console.log('[AUX] WORKER STARTED', {
-    WORKER_ID,
-    TYPES: WORKER_TYPES,
-    POLL_MS,
-    HEARTBEAT_SECS,
+  const SUPABASE_URL = mustEnv("SUPABASE_URL");
+  const SUPABASE_SERVICE_KEY = mustEnv("SUPABASE_SERVICE_KEY");
+
+  const WORKER_ID = (process.env.WORKER_ID || "ladder-worker-1").trim();
+  const types = parseWorkerTypes(process.env.WORKER_TYPES || "execute_intent");
+
+  const POLL_MS = Math.max(250, parseInt(process.env.POLL_MS || "2000", 10));
+  const HEARTBEAT_SECS = Math.max(5, parseInt(process.env.HEARTBEAT_SECS || "20", 10));
+  const HEARTBEAT_MS = HEARTBEAT_SECS * 1000;
+
+  const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+    auth: { persistSession: false },
   });
 
-  // loop forever
-  while (true) {
+  console.log(
+    `${nowIso()} [AUX] WORKER STARTED`,
+    JSON.stringify({ WORKER_ID, TYPES: types, POLL_MS, HEARTBEAT_SECS })
+  );
+
+  let stopping = false;
+  process.on("SIGTERM", () => (stopping = true));
+  process.on("SIGINT", () => (stopping = true));
+
+  while (!stopping) {
+    let claimedEnvelope = null;
+
     try {
-      const job = await claimJob();
-      if (!job) {
-        await sleep(POLL_MS);
-        continue;
+      claimedEnvelope = await claimJob(sb, WORKER_ID, types);
+    } catch (e) {
+      console.log(`${nowIso()} [claim] error: ${e.message}`);
+      await sleep(POLL_MS);
+      continue;
+    }
+
+    const claimed = claimedEnvelope && claimedEnvelope.claimed ? claimedEnvelope.claimed : null;
+
+    if (!claimed) {
+      await sleep(POLL_MS);
+      continue;
+    }
+
+    const jobId = claimed.id;
+    const runId = claimed.run_id;
+
+    console.log(`${nowIso()} [job] claimed`, JSON.stringify({ jobId, type: claimed.type, runId, payload: claimed.payload }));
+
+    // Heartbeat tick for this job while we work
+    let hbTimer = setInterval(() => {
+      safeHeartbeat(sb, jobId, WORKER_ID, runId, "working").catch(() => {});
+    }, HEARTBEAT_MS);
+
+    try {
+      await safeHeartbeat(sb, jobId, WORKER_ID, runId, "claimed_ok");
+
+      if (claimed.type === "execute_intent") {
+        const res = await executeIntentJob(sb, claimed);
+        console.log(`${nowIso()} [job] execute_intent done`, JSON.stringify({ jobId, runId, via: res.fn }));
+      } else {
+        throw new Error(`Unsupported job type: ${claimed.type}`);
       }
 
-      console.log('[AUX] CLAIMED', { id: job.id, type: job.type, run_id: job.run_id, payload: job.payload });
-      await runOne(job);
+      await finishJob(sb, jobId, "completed", null);
+      console.log(`${nowIso()} [job] finished completed`, JSON.stringify({ jobId, runId }));
     } catch (e) {
-      console.error('[AUX] LOOP_ERROR', e?.message ?? e);
-      await sleep(Math.max(1000, POLL_MS));
+      const err = (e && e.message) ? e.message : String(e);
+      console.log(`${nowIso()} [job] failed`, JSON.stringify({ jobId, runId, err }));
+      try {
+        await finishJob(sb, jobId, "failed", err.slice(0, 500));
+      } catch (finishErr) {
+        console.log(`${nowIso()} [finish] error: ${finishErr.message}`);
+      }
+    } finally {
+      clearInterval(hbTimer);
+      hbTimer = null;
     }
+
+    // Small pause between jobs so we don't hammer DB
+    await sleep(250);
   }
+
+  console.log(`${nowIso()} [AUX] worker stopping`);
 }
 
 main().catch((e) => {
-  console.error('[AUX] FATAL', e?.message ?? e);
+  console.log(`${nowIso()} [AUX] fatal: ${e.message || e}`);
   process.exit(1);
 });
