@@ -50,7 +50,13 @@ function parseTypes(raw) {
 
 async function httpPostJson(url, body, apiSecret) {
   const headers = { "content-type": "application/json" };
-  if (apiSecret) headers["x-api-key"] = apiSecret;
+
+  // â Send secret in multiple common formats (safe + future-proof)
+  if (apiSecret) {
+    headers["x-api-key"] = apiSecret;
+    headers["authorization"] = `Bearer ${apiSecret}`;
+    headers["x-worker-secret"] = apiSecret;
+  }
 
   const res = await fetch(url, {
     method: "POST",
@@ -89,7 +95,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 
 const BOT_WEBHOOK_URL = process.env.BOT_WEBHOOK_URL; // ladder-bot endpoint to execute intent
-const API_SECRET = process.env.API_SECRET; // optional shared secret header x-api-key
+const API_SECRET = String(process.env.API_SECRET || "").trim(); // optional shared secret header(s)
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error(`[${TAG}] Missing SUPABASE_URL or SUPABASE_SERVICE_KEY`);
@@ -146,7 +152,7 @@ async function finishJob(job_id, new_status, errText) {
 }
 
 /**
- * ✅ FIX: support BOTH claim_execution_job return shapes:
+ * â FIX: support BOTH claim_execution_job return shapes:
  *  1) OLD shape: { claimed: { id,type,run_id,payload } } or { claimed: null }
  *  2) CURRENT 2-arg overload shape: { id,type,run_id,payload } or NULL
  */
@@ -261,6 +267,8 @@ async function main() {
     HEARTBEAT_SECS,
     JOB_TIMEOUT_MS,
     hasWebhook: !!BOT_WEBHOOK_URL,
+    hasApiSecret: !!API_SECRET,
+    apiSecretLen: API_SECRET ? API_SECRET.length : 0,
   });
 
   if (!WORKER_ENABLED) {
@@ -319,6 +327,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error(`[${TAG}] fatal`, e);
+  console.error(`[${TAG}] Fatal:`, e);
   process.exit(1);
 });
