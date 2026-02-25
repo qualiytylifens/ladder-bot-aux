@@ -2,25 +2,17 @@
  * worker.js (CommonJS)
  * Minimal, production-safe execution worker for Railway.
  *
- * Requirements:
- *  - package.json deps: { "@supabase/supabase-js": "^2.x" }
- *  - NO dotenv
- *  - Uses Railway env vars directly
- *
  * Env vars expected (set in Railway):
  *  - SUPABASE_URL
- *  - SUPABASE_SERVICE_KEY   (service role key)
- *  - WORKER_ENABLED         ("true"/"false")
- *  - WORKER_ID              (e.g., "ladder-worker-1")
- *  - TYPES                  (e.g., "execute_intent") or JSON array string '["execute_intent"]'
- *  - POLL_MS                (e.g., "2000")
- *  - HEARTBEAT_SECS         (e.g., "20")  (not used yet; we will add heartbeat next step)
- *  - JOB_TIMEOUT_MS         (e.g., "60000")
- *  - WORKER_WEBHOOK_URL     (e.g., "https://ladder-helper-production.up.railway.app/webhook/worker")
- *
- * Notes:
- *  - This file intentionally does NOT implement DB heartbeat yet.
- *    Next step will add heartbeating from the claimer (institutional fix).
+ *  - SUPABASE_SERVICE_KEY
+ *  - WORKER_ENABLED
+ *  - WORKER_ID
+ *  - TYPES
+ *  - POLL_MS
+ *  - HEARTBEAT_SECS
+ *  - JOB_TIMEOUT_MS
+ *  - WORKER_WEBHOOK_URL   (executor endpoint, usually ladder-bot /webhook/worker)
+ *  - API_SECRET           (shared with ladder-bot; required for auth)
  */
 
 const { createClient } = require("@supabase/supabase-js");
@@ -31,7 +23,6 @@ function nowIso() {
 }
 
 function log(obj) {
-  // single-line JSON logs
   console.log(JSON.stringify(obj));
 }
 
@@ -60,7 +51,6 @@ function parseTypes(raw) {
       if (Array.isArray(arr) && arr.length) return arr.map(String);
     } catch {}
   }
-  // comma or space separated
   return s
     .split(/[,\s]+/g)
     .map((x) => x.trim())
@@ -78,6 +68,15 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   }
 }
 
+function safeTrim(v) {
+  return String(v || "").trim();
+}
+
+function normalizeWebhookUrl(u) {
+  // normalize minor mistakes like trailing spaces
+  return safeTrim(u);
+}
+
 // ---------- config ----------
 const TAG = "AUX";
 const WORKER_ENABLED = envBool("WORKER_ENABLED", true);
@@ -90,10 +89,12 @@ const JOB_TIMEOUT_MS = envInt("JOB_TIMEOUT_MS", 60000);
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 
-const WORKER_WEBHOOK_URL = process.env.WORKER_WEBHOOK_URL || ""; // where we POST execution
+const WORKER_WEBHOOK_URL = normalizeWebhookUrl(process.env.WORKER_WEBHOOK_URL || "");
+const API_SECRET = safeTrim(process.env.API_SECRET || "");
 
 const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
+const hasApiSecret = Boolean(API_SECRET);
 
 // ---------- start log ----------
 log({
@@ -108,12 +109,12 @@ log({
   JOB_TIMEOUT_MS,
   hasSupabase,
   hasWebhook,
+  hasApiSecret,
 });
 
-// If disabled, exit cleanly (so Railway shows disabled by env)
+// If disabled, exit cleanly
 if (!WORKER_ENABLED) {
   log({ tag: TAG, msg: "WORKER_DISABLED_BY_ENV", ts: nowIso() });
-  // keep process alive a short moment to flush logs
   setTimeout(() => process.exit(0), 250);
   return;
 }
@@ -133,7 +134,16 @@ if (!hasWebhook) {
     tag: TAG,
     msg: "WARN_MISSING_WEBHOOK_URL",
     ts: nowIso(),
-    hint: "Set WORKER_WEBHOOK_URL to your executor endpoint",
+    hint: "Set WORKER_WEBHOOK_URL to your executor endpoint (ladder-bot /webhook/worker)",
+  });
+}
+
+if (hasWebhook && !hasApiSecret) {
+  log({
+    tag: TAG,
+    msg: "WARN_MISSING_API_SECRET",
+    ts: nowIso(),
+    hint: "Set API_SECRET (must match ladder-bot API_SECRET) to avoid webhook_failed_http_401",
   });
 }
 
@@ -143,10 +153,7 @@ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 });
 
 // ---------- core DB ops ----------
-// We are assuming an execution_jobs table similar to what you showed.
-// If your column names differ, we’ll adjust next step.
 async function pickQueuedJob(types) {
-  // Get one queued job (not claimed)
   const { data, error } = await sb
     .from("execution_jobs")
     .select("id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step")
@@ -161,8 +168,7 @@ async function pickQueuedJob(types) {
 }
 
 async function claimJob(jobId) {
-  // Atomic claim: only claim if still queued + unclaimed
-  const now = new Date().toISOString();
+  const now = nowIso();
   const { data, error } = await sb
     .from("execution_jobs")
     .update({
@@ -184,7 +190,7 @@ async function claimJob(jobId) {
 }
 
 async function completeJob(jobId) {
-  const now = new Date().toISOString();
+  const now = nowIso();
   const { error } = await sb
     .from("execution_jobs")
     .update({
@@ -199,7 +205,7 @@ async function completeJob(jobId) {
 }
 
 async function failJob(jobId, lastErrorCode) {
-  const now = new Date().toISOString();
+  const now = nowIso();
   const { error } = await sb
     .from("execution_jobs")
     .update({
@@ -216,9 +222,10 @@ async function failJob(jobId, lastErrorCode) {
 
 // ---------- webhook execution ----------
 async function executeViaWebhook(job) {
-  if (!hasWebhook) return { ok: false, code: "missing_webhook_url", detail: "WORKER_WEBHOOK_URL not set" };
+  if (!hasWebhook) {
+    return { ok: false, code: "missing_webhook_url", detail: "WORKER_WEBHOOK_URL not set" };
+  }
 
-  // We POST the job payload. Your ladder-bot endpoint must exist & accept JSON.
   const body = {
     job_id: job.id,
     type: job.type,
@@ -227,11 +234,23 @@ async function executeViaWebhook(job) {
     ts: nowIso(),
   };
 
+  // Send auth in multiple header styles for compatibility with ladder-bot implementations.
+  // Ladder-bot should validate API_SECRET on one of these.
+  const headers = {
+    "content-type": "application/json",
+  };
+
+  if (hasApiSecret) {
+    headers["x-api-secret"] = API_SECRET;
+    headers["x-api-key"] = API_SECRET;
+    headers["authorization"] = `Bearer ${API_SECRET}`;
+  }
+
   const res = await fetchWithTimeout(
     WORKER_WEBHOOK_URL,
     {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     },
     JOB_TIMEOUT_MS
@@ -261,10 +280,8 @@ async function loop() {
         continue;
       }
 
-      // claim
       const claimed = await claimJob(candidate.id);
       if (!claimed) {
-        // race: someone else claimed it
         await sleep(250);
         continue;
       }
@@ -279,18 +296,11 @@ async function loop() {
         last_step: claimed.last_step,
       });
 
-      // execute
       const result = await executeViaWebhook(claimed);
 
       if (result.ok) {
         await completeJob(claimed.id);
-        log({
-          tag: TAG,
-          msg: "JOB_COMPLETED",
-          ts: nowIso(),
-          id: claimed.id,
-          type: claimed.type,
-        });
+        log({ tag: TAG, msg: "JOB_COMPLETED", ts: nowIso(), id: claimed.id, type: claimed.type });
       } else {
         await failJob(claimed.id, result.code);
         log({
@@ -304,7 +314,6 @@ async function loop() {
         });
       }
 
-      // short pause to avoid tight loop after work
       await sleep(250);
     } catch (err) {
       log({
