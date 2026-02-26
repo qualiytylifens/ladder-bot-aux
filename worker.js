@@ -3,33 +3,34 @@
  * Production-safe execution worker for Railway + Supabase.
  *
  * Core job:
- *  - claim execution_jobs(status='queued') and POST to WORKER_WEBHOOK_URL
+ *  - claim execution_jobs(status='queued') where:
+ *      - claimed_by is null
+ *      - run_at is null OR run_at <= now()
+ *  - POST to WORKER_WEBHOOK_URL (ladder-bot /webhook/worker) with API_SECRET auth
  *
- * Self-heal:
- *  - If queue is empty, requeue "deadletter_max_attempts" exit jobs
- *    ONLY when their trade is still open (paper mode).
+ * Retry:
+ *  - Uses execution_jobs.attempts (persisted in DB)
+ *  - On failure: increments attempts, requeues with backoff by setting run_at in the future
+ *  - When attempts reaches MAX_ATTEMPTS: marks failed with last_error=deadletter_max_attempts
  *
- * Optional emergency mode (OFF by default):
- *  - ENQUEUE_FROM_APPROVED=1
- *    Backfill missing execution_jobs from execution_intents(status='approved')
+ * Self-heal (optional):
+ *  - Requeues deadlettered EXIT/CLOSE jobs only if trade is still OPEN (paper mode)
+ *  - Archives the old dead job for clean history
  *
- * Env vars expected:
+ * Env vars:
  *  - SUPABASE_URL
  *  - SUPABASE_SERVICE_KEY
- *  - WORKER_ENABLED
+ *  - WORKER_ENABLED ("true"/"false")
  *  - WORKER_ID
- *  - TYPES
- *  - POLL_MS
- *  - HEARTBEAT_SECS
- *  - JOB_TIMEOUT_MS
- *  - WORKER_WEBHOOK_URL
- *  - API_SECRET
+ *  - TYPES (e.g. "execute_intent" or JSON '["execute_intent"]')
+ *  - POLL_MS (default 2000)
+ *  - JOB_TIMEOUT_MS (default 60000)
+ *  - WORKER_WEBHOOK_URL (e.g. https://ladder-bot-production.up.railway.app/webhook/worker)
+ *  - API_SECRET (must match ladder-bot API_SECRET)
  *
  * Optional:
- *  - MAX_ATTEMPTS (default 3)          // per-job attempts inside worker (not DB attempts)
- *  - RETRY_BACKOFF_MS (default 5000)
- *  - ENQUEUE_FROM_APPROVED (default 0)
- *  - ENQUEUE_BATCH (default 25)
+ *  - MAX_ATTEMPTS (default 3)
+ *  - RETRY_BACKOFF_MS (default 5000)   // base backoff; multiplied by attempts
  *  - SELFHEAL_DEADLETTER (default 1)
  *  - SELFHEAL_BATCH (default 25)
  */
@@ -74,8 +75,7 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...opts, signal: controller.signal });
-    return res;
+    return await fetch(url, { ...opts, signal: controller.signal });
   } finally {
     clearTimeout(id);
   }
@@ -86,24 +86,14 @@ function safeTrim(v) {
 function normalizeWebhookUrl(u) {
   return safeTrim(u);
 }
-function hostFromUrl(u) {
-  try {
-    return new URL(u).host;
-  } catch {
-    return null;
-  }
+function isExitAction(action) {
+  const a = String(action || "").toLowerCase();
+  return a === "close" || a === "exit" || a === "sell";
 }
-function jget(obj, path, fallback = null) {
-  try {
-    let cur = obj;
-    for (const k of path) {
-      if (cur == null) return fallback;
-      cur = cur[k];
-    }
-    return cur == null ? fallback : cur;
-  } catch {
-    return fallback;
-  }
+function msBackoff(baseMs, attempts) {
+  // attempts starts at 0 in your rows; backoff uses (attempts+1)
+  const n = Math.max(1, Number(attempts || 0) + 1);
+  return baseMs * n;
 }
 
 // ---------- config ----------
@@ -112,14 +102,10 @@ const WORKER_ENABLED = envBool("WORKER_ENABLED", true);
 const WORKER_ID = process.env.WORKER_ID || "ladder-worker-1";
 const TYPES = parseTypes(process.env.TYPES || process.env.WORKER_TYPES || "execute_intent");
 const POLL_MS = envInt("POLL_MS", 2000);
-const HEARTBEAT_SECS = envInt("HEARTBEAT_SECS", 20);
 const JOB_TIMEOUT_MS = envInt("JOB_TIMEOUT_MS", 60000);
 
 const MAX_ATTEMPTS = envInt("MAX_ATTEMPTS", 3);
 const RETRY_BACKOFF_MS = envInt("RETRY_BACKOFF_MS", 5000);
-
-const ENQUEUE_FROM_APPROVED = envBool("ENQUEUE_FROM_APPROVED", false);
-const ENQUEUE_BATCH = envInt("ENQUEUE_BATCH", 25);
 
 const SELFHEAL_DEADLETTER = envBool("SELFHEAL_DEADLETTER", true);
 const SELFHEAL_BATCH = envInt("SELFHEAL_BATCH", 25);
@@ -127,15 +113,15 @@ const SELFHEAL_BATCH = envInt("SELFHEAL_BATCH", 25);
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 
-const WORKER_WEBHOOK_URL = normalizeWebhookUrl(process.env.WORKER_WEBHOOK_URL || process.env.WEBHOOK_URL || "");
+const WORKER_WEBHOOK_URL = normalizeWebhookUrl(
+  process.env.WORKER_WEBHOOK_URL || process.env.WEBHOOK_URL || process.env.WORKER_WEBHOOK || ""
+);
+
 const API_SECRET = safeTrim(process.env.API_SECRET || "");
 
 const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
 const hasApiSecret = Boolean(API_SECRET);
-
-const supabaseHost = hostFromUrl(SUPABASE_URL);
-const webhookHost = hostFromUrl(WORKER_WEBHOOK_URL);
 
 // ---------- start log ----------
 log({
@@ -146,20 +132,15 @@ log({
   WORKER_ID,
   TYPES,
   POLL_MS,
-  HEARTBEAT_SECS,
   JOB_TIMEOUT_MS,
   MAX_ATTEMPTS,
   RETRY_BACKOFF_MS,
-  ENQUEUE_FROM_APPROVED,
-  ENQUEUE_BATCH,
   SELFHEAL_DEADLETTER,
   SELFHEAL_BATCH,
   hasSupabase,
   hasWebhook,
   hasApiSecret,
-  supabase_host: supabaseHost,
-  webhook_host: webhookHost,
-  webhook_url_prefix: WORKER_WEBHOOK_URL ? WORKER_WEBHOOK_URL.slice(0, 60) : null,
+  webhook_url_prefix: WORKER_WEBHOOK_URL ? WORKER_WEBHOOK_URL.slice(0, 80) : null,
 });
 
 if (!WORKER_ENABLED) {
@@ -200,12 +181,18 @@ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 
 // ---------- core DB ops ----------
 async function pickQueuedJob(types) {
+  const now = nowIso();
+
+  // IMPORTANT: only runnable now (run_at is null OR run_at <= now)
   const { data, error } = await sb
     .from("execution_jobs")
-    .select("id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at,intent_id")
+    .select(
+      "id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at,intent_id"
+    )
     .in("type", types)
     .eq("status", "queued")
     .is("claimed_by", null)
+    .or(`run_at.is.null,run_at.lte.${now}`)
     .order("run_at", { ascending: true })
     .order("created_at", { ascending: true })
     .limit(1);
@@ -216,6 +203,8 @@ async function pickQueuedJob(types) {
 
 async function claimJob(jobId) {
   const now = nowIso();
+
+  // Atomic claim: only if still queued + unclaimed + runnable now
   const { data, error } = await sb
     .from("execution_jobs")
     .update({
@@ -229,7 +218,10 @@ async function claimJob(jobId) {
     .eq("id", jobId)
     .eq("status", "queued")
     .is("claimed_by", null)
-    .select("id,type,status,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at,intent_id")
+    .or(`run_at.is.null,run_at.lte.${now}`)
+    .select(
+      "id,type,status,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at,intent_id"
+    )
     .limit(1);
 
   if (error) throw error;
@@ -251,20 +243,54 @@ async function completeJob(jobId) {
   if (error) throw error;
 }
 
-async function failJob(jobId, lastErrorCode) {
+async function markFailedDeadletter(jobId, lastErrorCode) {
   const now = nowIso();
   const { error } = await sb
     .from("execution_jobs")
     .update({
       status: "failed",
       heartbeat_at: now,
-      last_step: "failed",
-      last_error: lastErrorCode || "unknown_error",
+      last_step: "failed_deadletter",
+      last_error: lastErrorCode || "deadletter_max_attempts",
     })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
 
   if (error) throw error;
+}
+
+async function requeueWithBackoff(job, lastErrorCode) {
+  const now = new Date();
+  const backoffMs = msBackoff(RETRY_BACKOFF_MS, job.attempts);
+  const nextRunAt = new Date(now.getTime() + backoffMs).toISOString();
+  const nextAttempts = Number(job.attempts || 0) + 1;
+
+  const { error } = await sb
+    .from("execution_jobs")
+    .update({
+      status: "queued",
+      claimed_by: null,
+      claimed_at: null,
+      heartbeat_at: now.toISOString(),
+      last_step: `retry_queued_${nextAttempts}`,
+      last_error: lastErrorCode || "retry",
+      attempts: nextAttempts,
+      run_at: nextRunAt,
+    })
+    .eq("id", job.id)
+    .eq("claimed_by", WORKER_ID);
+
+  if (error) throw error;
+
+  log({
+    tag: TAG,
+    msg: "JOB_REQUEUED",
+    ts: nowIso(),
+    id: job.id,
+    attempt: nextAttempts,
+    next_run_at: nextRunAt,
+    last_error: lastErrorCode,
+  });
 }
 
 // ---------- webhook execution ----------
@@ -283,6 +309,7 @@ async function executeViaWebhook(job) {
 
   const headers = { "content-type": "application/json" };
   if (hasApiSecret) {
+    // include multiple common header styles for compatibility
     headers["x-api-secret"] = API_SECRET;
     headers["x-api-key"] = API_SECRET;
     headers["authorization"] = `Bearer ${API_SECRET}`;
@@ -298,274 +325,117 @@ async function executeViaWebhook(job) {
   if (!res.ok) {
     return { ok: false, code: `webhook_failed_http_${res.status}`, detail: text.slice(0, 500) };
   }
+
   return { ok: true, code: "ok", detail: text.slice(0, 500) };
 }
 
-// ---------- queue audit (lightweight) ----------
-async function queueAudit() {
-  async function countJobsByStatus(status) {
-    const { count, error } = await sb.from("execution_jobs").select("id", { count: "exact", head: true }).eq("status", status);
-    if (error) throw error;
-    return count || 0;
-  }
-  async function countIntentsByStatus(status) {
-    const { count, error } = await sb.from("execution_intents").select("id", { count: "exact", head: true }).eq("status", status);
-    if (error) throw error;
-    return count || 0;
-  }
-
-  const statusCounts = {
-    queued: await countJobsByStatus("queued"),
-    running: await countJobsByStatus("running"),
-    completed: await countJobsByStatus("completed"),
-    failed: await countJobsByStatus("failed"),
-    archived: await countJobsByStatus("archived"),
-    cancelled: await countJobsByStatus("cancelled"),
-  };
-
-  const { count: queuedForTypes, error: e2 } = await sb
-    .from("execution_jobs")
-    .select("id", { count: "exact", head: true })
-    .eq("status", "queued")
-    .is("claimed_by", null)
-    .in("type", TYPES);
-  if (e2) throw e2;
-
-  const pendingIntents = await countIntentsByStatus("pending");
-  const approvedIntents = await countIntentsByStatus("approved");
-
-  const { data: oldest, error: e3 } = await sb
-    .from("execution_jobs")
-    .select("run_at")
-    .eq("status", "queued")
-    .order("run_at", { ascending: true })
-    .limit(1);
-  if (e3) throw e3;
-
-  const { data: recentJobs, error: e4 } = await sb
-    .from("execution_jobs")
-    .select("id,intent_id,type,status,claimed_by,run_at,created_at,attempts,last_step,last_error")
-    .order("created_at", { ascending: false })
-    .limit(5);
-  if (e4) throw e4;
-
-  log({
-    tag: TAG,
-    msg: "QUEUE_AUDIT",
-    ts: nowIso(),
-    types: TYPES,
-    statusCounts,
-    queuedForTypes: queuedForTypes || 0,
-    pendingIntents,
-    approvedIntents,
-    oldest_run_at: oldest && oldest[0] ? oldest[0].run_at : null,
-    recentJobs: (recentJobs || []).map((j) => ({
-      id: j.id,
-      intent_id: j.intent_id,
-      type: j.type,
-      status: j.status,
-      claimed_by: j.claimed_by,
-      run_at: j.run_at,
-      created_at: j.created_at,
-      attempts: j.attempts,
-      last_step: j.last_step,
-      last_error: j.last_error,
-    })),
-  });
-
-  return statusCounts;
-}
-
-// ---------- emergency: enqueue jobs from approved intents (missing runnable job) ----------
-async function enqueueFromApproved(maxBatch) {
-  if (!ENQUEUE_FROM_APPROVED) return 0;
-
-  // Pull approved intents (include raw_signal so we can derive trade_id safely)
-  const { data: intents, error: e1 } = await sb
-    .from("execution_intents")
-    .select("id,action,symbol,execution_mode,created_at,raw_signal")
-    .eq("status", "approved")
-    .order("created_at", { ascending: true })
-    .limit(maxBatch);
-  if (e1) throw e1;
-  if (!intents || intents.length === 0) return 0;
-
-  const intentIds = intents.map((x) => x.id);
-
-  // Find intents that already have a runnable job (queued or running)
-  const { data: runnable, error: e2 } = await sb
-    .from("execution_jobs")
-    .select("intent_id,status")
-    .in("intent_id", intentIds)
-    .in("status", ["queued", "running"]);
-  if (e2) throw e2;
-
-  const runnableSet = new Set((runnable || []).map((x) => x.intent_id));
-  const missing = intents.filter((i) => !runnableSet.has(i.id));
-  if (missing.length === 0) {
-    log({
-      tag: TAG,
-      msg: "ENQUEUE_DEBUG",
-      ts: nowIso(),
-      approved_batch: intents.length,
-      runnable_jobs_found: runnableSet.size,
-      missing_jobs: 0,
-      inserted: 0,
-      note: "All approved intents already have runnable execution_jobs (queued/running).",
-    });
-    return 0;
-  }
-
-  const now = nowIso();
-  const rows = missing.map((i) => {
-    const tradeId = (i.raw_signal && (i.raw_signal.trade_id || i.raw_signal["trade_id"])) || null;
-    return {
-      created_at: now,
-      run_at: now,
-      intent_id: i.id,
-      type: "execute_intent",
-      payload: {
-        intent_id: i.id,
-        action: i.action,
-        symbol: i.symbol,
-        execution_mode: i.execution_mode || "paper",
-        trade_id: tradeId,
-        created_from: "worker_enqueue_from_approved_missing_runnable",
-      },
-      status: "queued",
-      attempts: 0,
-      last_error: null,
-      claimed_by: null,
-      claimed_at: null,
-      heartbeat_at: null,
-      run_id: null,
-      last_step: "enqueued_by_worker",
-    };
-  });
-
-  const { error: e3 } = await sb.from("execution_jobs").insert(rows);
-  if (e3) throw e3;
-
-  log({
-    tag: TAG,
-    msg: "ENQUEUE_FROM_APPROVED",
-    ts: nowIso(),
-    approved_batch: intents.length,
-    missing_runnable: missing.length,
-    inserted: rows.length,
-  });
-
-  return rows.length;
-}
-
-// ---------- selfheal: requeue deadletter exits when trade still open ----------
+// ---------- selfheal helpers ----------
 async function tradeIsOpen(tradeId) {
   if (!tradeId) return null;
+  const { data, error } = await sb.from("trades_prod").select("id,status,metadata").eq("id", tradeId).limit(1);
+  if (error) throw error;
+  const row = data && data[0] ? data[0] : null;
+  if (!row) return null;
 
-  const { data, error } = await sb
-    .from("trades_prod")
-    .select("id,status")
-    .eq("id", tradeId)
-    .limit(1);
+  // optional: only selfheal paper trades
+  const mode = row.metadata && row.metadata.mode ? String(row.metadata.mode) : null;
+  if (mode && mode !== "paper") return false;
+
+  return String(row.status || "").toLowerCase() === "open";
+}
+
+async function archiveJob(jobId, note) {
+  const now = nowIso();
+  const { error } = await sb
+    .from("execution_jobs")
+    .update({
+      status: "archived",
+      heartbeat_at: now,
+      last_step: "archived_by_selfheal",
+      last_error: note || "archived_by_selfheal",
+    })
+    .eq("id", jobId);
 
   if (error) throw error;
-  if (!data || !data[0]) return null;
-  return String(data[0].status || "").toLowerCase() === "open";
 }
 
-function isExitAction(action) {
-  const a = String(action || "").toLowerCase();
-  return a === "close" || a === "exit" || a === "sell";
+async function insertNewQueuedJobFrom(oldJob, patchPayload) {
+  const now = nowIso();
+  const row = {
+    created_at: now,
+    run_at: now,
+    intent_id: oldJob.intent_id || null,
+    type: oldJob.type || "execute_intent",
+    payload: {
+      ...(oldJob.payload || {}),
+      ...(patchPayload || {}),
+      prev_job_id: oldJob.id,
+      created_from: "worker_selfheal_requeue_deadletter",
+    },
+    status: "queued",
+    attempts: 0,
+    last_error: null,
+    claimed_by: null,
+    claimed_at: null,
+    heartbeat_at: null,
+    run_id: null,
+    last_step: "selfheal_requeued",
+  };
+
+  const { error } = await sb.from("execution_jobs").insert([row]);
+  if (error) throw error;
 }
 
-async function requeueDeadletter(maxBatch) {
+async function selfhealDeadletters(batch) {
   if (!SELFHEAL_DEADLETTER) return 0;
 
-  // Find deadlettered jobs (failed with deadletter_max_attempts)
-  const { data: dead, error: e1 } = await sb
+  const { data: dead, error } = await sb
     .from("execution_jobs")
     .select("id,intent_id,type,status,payload,created_at,run_at,last_error,last_step")
-    .eq("type", "execute_intent")
     .eq("status", "failed")
     .eq("last_error", "deadletter_max_attempts")
     .order("created_at", { ascending: true })
-    .limit(maxBatch);
-  if (e1) throw e1;
+    .limit(batch);
+
+  if (error) throw error;
   if (!dead || dead.length === 0) return 0;
 
-  // Pull corresponding intents to get raw_signal for trade_id if missing in payload
+  // pull intents only to access raw_signal.trade_id (NO execution_intents.trade_id usage)
   const intentIds = dead.map((j) => j.intent_id).filter(Boolean);
   const { data: intents, error: e2 } = await sb
     .from("execution_intents")
-    .select("id,action,symbol,execution_mode,raw_signal")
+    .select("id,raw_signal,action,symbol,execution_mode")
     .in("id", intentIds);
-  if (e2) throw e2;
 
+  if (e2) throw e2;
   const intentMap = new Map((intents || []).map((i) => [i.id, i]));
 
-  let inserted = 0;
+  let requeued = 0;
+
   for (const j of dead) {
-    const intent = intentMap.get(j.intent_id) || null;
+    const intent = j.intent_id ? intentMap.get(j.intent_id) : null;
 
-    const action = jget(j, ["payload", "action"], null) || (intent ? intent.action : null);
-    const symbol = jget(j, ["payload", "symbol"], null) || (intent ? intent.symbol : null);
+    const action = (j.payload && j.payload.action) || (intent ? intent.action : null);
+    if (!isExitAction(action)) continue;
 
-    if (!isExitAction(action)) {
-      log({ tag: TAG, msg: "SELFHEAL_SKIP_NOT_EXIT", ts: nowIso(), job_id: j.id, intent_id: j.intent_id, action });
-      continue;
-    }
-
-    const tradeIdFromPayload = jget(j, ["payload", "trade_id"], null);
-    const tradeIdFromIntent = intent && intent.raw_signal ? (intent.raw_signal.trade_id || intent.raw_signal["trade_id"]) : null;
-    const tradeId = tradeIdFromPayload || tradeIdFromIntent;
+    const tradeId =
+      (j.payload && j.payload.trade_id) ||
+      (intent && intent.raw_signal ? intent.raw_signal.trade_id || intent.raw_signal["trade_id"] : null);
 
     const open = await tradeIsOpen(tradeId);
-    if (open !== true) {
-      log({
-        tag: TAG,
-        msg: "SELFHEAL_SKIP_TRADE_NOT_OPEN",
-        ts: nowIso(),
-        job_id: j.id,
-        intent_id: j.intent_id,
-        trade_id: tradeId,
-        trade_open: open,
-      });
-      continue;
-    }
+    if (open !== true) continue;
 
-    // Requeue as a NEW job row (safe, immutable history)
-    const now = nowIso();
-    const row = {
-      created_at: now,
-      run_at: now,
-      intent_id: j.intent_id,
-      type: "execute_intent",
-      payload: {
-        intent_id: j.intent_id,
-        action,
-        symbol,
-        execution_mode: (intent && intent.execution_mode) || jget(j, ["payload", "execution_mode"], "paper") || "paper",
-        trade_id: tradeId,
-        created_from: "worker_selfheal_requeue_deadletter_open_trade",
-        prev_job_id: j.id,
-      },
-      status: "queued",
-      attempts: 0,
-      last_error: null,
-      claimed_by: null,
-      claimed_at: null,
-      heartbeat_at: null,
-      run_id: null,
-      last_step: "selfheal_requeued",
-    };
+    await insertNewQueuedJobFrom(j, {
+      action,
+      symbol: (j.payload && j.payload.symbol) || (intent ? intent.symbol : null),
+      execution_mode: (j.payload && j.payload.execution_mode) || (intent ? intent.execution_mode : "paper"),
+      trade_id: tradeId,
+    });
 
-    const { error: e3 } = await sb.from("execution_jobs").insert([row]);
-    if (e3) {
-      log({ tag: TAG, msg: "SELFHEAL_INSERT_ERROR", ts: nowIso(), job_id: j.id, error: String(e3.message || e3) });
-      continue;
-    }
+    await archiveJob(j.id, "selfheal_archived_after_requeue");
 
-    inserted += 1;
+    requeued += 1;
+
     log({
       tag: TAG,
       msg: "SELFHEAL_REQUEUED",
@@ -574,52 +444,30 @@ async function requeueDeadletter(maxBatch) {
       intent_id: j.intent_id,
       trade_id: tradeId,
       action,
-      symbol,
     });
   }
 
-  return inserted;
+  return requeued;
 }
 
 // ---------- main loop ----------
-let lastAuditAt = 0;
-let inFlightAttempts = new Map(); // job_id -> n attempts in this process
-
 async function loop() {
   while (true) {
     try {
       log({ tag: TAG, msg: "POLL", ts: nowIso(), types: TYPES });
 
-      const nowMs = Date.now();
-      if (nowMs - lastAuditAt > 15000) {
-        lastAuditAt = nowMs;
-        await queueAudit();
-      }
-
-      // Backfill missing runnable jobs from approved intents (optional)
-      await enqueueFromApproved(ENQUEUE_BATCH);
-
-      // If nothing queued, selfheal deadletter exits (safe)
-      // (This is the part that was crashing before because of execution_intents.trade_id)
-      await requeueDeadletter(SELFHEAL_BATCH);
+      // opportunistic selfheal (safe; does nothing if none)
+      await selfhealDeadletters(SELFHEAL_BATCH);
 
       const candidate = await pickQueuedJob(TYPES);
       if (!candidate) {
-        log({
-          tag: TAG,
-          msg: "PICK_DEBUG",
-          ts: nowIso(),
-          queued_total_for_types: 0,
-          unclaimed_runnable_now: 0,
-          oldest_run_at: null,
-          runnable_found: false,
-        });
         await sleep(POLL_MS);
         continue;
       }
 
       const claimed = await claimJob(candidate.id);
       if (!claimed) {
+        // race condition
         await sleep(250);
         continue;
       }
@@ -631,56 +479,34 @@ async function loop() {
         id: claimed.id,
         type: claimed.type,
         intent_id: claimed.intent_id,
-        claimed_by: claimed.claimed_by,
-        last_step: claimed.last_step,
+        attempts: claimed.attempts,
       });
 
       const result = await executeViaWebhook(claimed);
 
       if (result.ok) {
         await completeJob(claimed.id);
-        inFlightAttempts.delete(claimed.id);
         log({ tag: TAG, msg: "JOB_COMPLETED", ts: nowIso(), id: claimed.id, type: claimed.type });
       } else {
-        // retry a few times inside worker process before marking failed
-        const n = (inFlightAttempts.get(claimed.id) || 0) + 1;
-        inFlightAttempts.set(claimed.id, n);
+        const attempts = Number(claimed.attempts || 0);
 
-        if (n < MAX_ATTEMPTS) {
-          // put back to queued for retry
-          const now = nowIso();
-          const { error } = await sb
-            .from("execution_jobs")
-            .update({
-              status: "queued",
-              claimed_by: null,
-              claimed_at: null,
-              heartbeat_at: now,
-              last_step: `retry_${n}`,
-              last_error: result.code,
-              run_at: now,
-            })
-            .eq("id", claimed.id)
-            .eq("claimed_by", WORKER_ID);
-          if (error) throw error;
-
+        // IMPORTANT: persisted retry using DB attempts
+        if (attempts + 1 >= MAX_ATTEMPTS) {
+          await markFailedDeadletter(claimed.id, "deadletter_max_attempts");
           log({
             tag: TAG,
-            msg: "JOB_RETRY_QUEUED",
+            msg: "JOB_DEADLETTERED",
             ts: nowIso(),
             id: claimed.id,
-            attempt: n,
+            type: claimed.type,
             last_error: result.code,
             detail: result.detail,
           });
-
-          await sleep(RETRY_BACKOFF_MS);
         } else {
-          await failJob(claimed.id, result.code);
-          inFlightAttempts.delete(claimed.id);
+          await requeueWithBackoff(claimed, result.code);
           log({
             tag: TAG,
-            msg: "JOB_FAILED",
+            msg: "JOB_WEBHOOK_FAILED_RETRYING",
             ts: nowIso(),
             id: claimed.id,
             type: claimed.type,
