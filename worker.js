@@ -1,6 +1,6 @@
 /**
  * worker.js (CommonJS)
- * Minimal, production-safe execution worker for Railway.
+ * Production-safe execution worker for Railway.
  *
  * Env vars expected (set in Railway):
  *  - SUPABASE_URL
@@ -76,13 +76,11 @@ function normalizeWebhookUrl(u) {
   return safeTrim(u);
 }
 
-function lower(v) {
-  return String(v || "").toLowerCase();
-}
-
-function isExitAction(a) {
-  const x = lower(a);
-  return x === "close" || x === "sell" || x === "exit";
+function isRunnableRunAt(runAt) {
+  if (!runAt) return true;
+  const t = new Date(runAt).getTime();
+  if (!Number.isFinite(t)) return true; // if malformed, treat as runnable to avoid deadlocks
+  return t <= Date.now();
 }
 
 // ---------- config ----------
@@ -118,9 +116,9 @@ log({
   hasSupabase,
   hasWebhook,
   hasApiSecret,
+  WORKER_WEBHOOK_URL: hasWebhook ? WORKER_WEBHOOK_URL : "(missing)",
 });
 
-// If disabled, exit cleanly
 if (!WORKER_ENABLED) {
   log({ tag: TAG, msg: "WORKER_DISABLED_BY_ENV", ts: nowIso() });
   setTimeout(() => process.exit(0), 250);
@@ -162,21 +160,40 @@ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
 
 // ---------- core DB ops ----------
 async function pickQueuedJob(types) {
+  // Fetch a small batch (not just 1) so we can:
+  // - skip non-runnable run_at
+  // - tolerate claimed_by = '' (empty string) as "unclaimed"
+  // - avoid deadlocks where the oldest row is scheduled for the future
   const { data, error } = await sb
     .from("execution_jobs")
-    .select("id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step")
+    .select("id,type,status,run_at,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
     .in("type", types)
     .eq("status", "queued")
-    .is("claimed_by", null)
+    .or('claimed_by.is.null,claimed_by.eq.""') // ✅ NULL or empty string
     .order("created_at", { ascending: true })
-    .limit(1);
+    .limit(25);
 
   if (error) throw error;
-  return data && data[0] ? data[0] : null;
+
+  const rows = Array.isArray(data) ? data : [];
+  const runnable = rows.find((r) => isRunnableRunAt(r.run_at)) || null;
+
+  // diagnostic (cheap and very useful)
+  log({
+    tag: TAG,
+    msg: "PICK_DEBUG",
+    ts: nowIso(),
+    queued_seen: rows.length,
+    runnable_found: Boolean(runnable),
+    oldest_run_at: rows[0]?.run_at ?? null,
+  });
+
+  return runnable;
 }
 
 async function claimJob(jobId) {
   const now = nowIso();
+  // claim only if still queued + still unclaimed (NULL or '')
   const { data, error } = await sb
     .from("execution_jobs")
     .update({
@@ -189,8 +206,8 @@ async function claimJob(jobId) {
     })
     .eq("id", jobId)
     .eq("status", "queued")
-    .is("claimed_by", null)
-    .select("id,type,status,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
+    .or('claimed_by.is.null,claimed_by.eq.""')
+    .select("id,type,status,run_at,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
     .limit(1);
 
   if (error) throw error;
@@ -228,99 +245,21 @@ async function failJob(jobId, lastErrorCode) {
   if (error) throw error;
 }
 
-// ---------- intent/trade helpers ----------
-async function fetchIntent(intentId) {
-  const { data, error } = await sb
-    .from("execution_intents")
-    .select("id,action,symbol,status,reason,execution_mode,raw_signal,created_at")
-    .eq("id", intentId)
-    .limit(1);
-
-  if (error) throw error;
-  return data && data[0] ? data[0] : null;
-}
-
-function extractTradeId(intent) {
-  const rs = intent && intent.raw_signal ? intent.raw_signal : null;
-  if (!rs || typeof rs !== "object") return null;
-  return (
-    rs.trade_id ||
-    rs.tradeId ||
-    rs.tradeID ||
-    rs.position_id ||
-    rs.positionId ||
-    null
-  );
-}
-
-async function isTradeStillOpen(tradeId) {
-  if (!tradeId) return null;
-  const { data, error } = await sb
-    .from("trades_prod")
-    .select("id,status,closed_at")
-    .eq("id", tradeId)
-    .limit(1);
-
-  if (error) throw error;
-  if (!data || !data[0]) return null;
-  return String(data[0].status || "").toLowerCase() === "open";
-}
-
 // ---------- webhook execution ----------
 async function executeViaWebhook(job) {
   if (!hasWebhook) {
     return { ok: false, code: "missing_webhook_url", detail: "WORKER_WEBHOOK_URL not set" };
   }
 
-  const p = job.payload || {};
-  const intentId = p.intent_id || p.intentId || p.intent || null;
-  const action = p.action || null;
-  const symbol = p.symbol || null;
-
-  let intent = null;
-  if (intentId) {
-    intent = await fetchIntent(intentId);
-  }
-
-  const effectiveAction = (intent && intent.action) ? intent.action : action;
-  const effectiveSymbol = (intent && intent.symbol) ? intent.symbol : symbol;
-  const executionMode = (intent && intent.execution_mode) ? intent.execution_mode : (p.execution_mode || p.mode || "paper");
-  const tradeId = extractTradeId(intent) || p.trade_id || p.tradeId || null;
-
-  // ✅ CRITICAL: ensure ladder-bot can read everything from payload OR top-level
-  const payloadOut = {
-    ...(job.payload || {}),
-    action: effectiveAction,
-    symbol: effectiveSymbol,
-    intent_id: intentId,
-    trade_id: tradeId,
-    execution_mode: executionMode,
-  };
-
   const body = {
-    // common ladder-bot style (flattened)
-    action: effectiveAction,
-    symbol: effectiveSymbol,
-    intent_id: intentId,
-    trade_id: tradeId,
-    execution_mode: executionMode,
-
-    // tracing
     job_id: job.id,
     type: job.type,
+    payload: job.payload || {},
     worker_id: WORKER_ID,
     ts: nowIso(),
-
-    // compatibility: many handlers only read this
-    payload: payloadOut,
-
-    // debug only
-    intent_snapshot: intent ? { id: intent.id, status: intent.status, reason: intent.reason, created_at: intent.created_at } : null,
   };
 
-  const headers = {
-    "content-type": "application/json",
-  };
+  const headers = { "content-type": "application/json" };
 
   if (hasApiSecret) {
     headers["x-api-secret"] = API_SECRET;
@@ -330,36 +269,13 @@ async function executeViaWebhook(job) {
 
   const res = await fetchWithTimeout(
     WORKER_WEBHOOK_URL,
-    {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    },
+    { method: "POST", headers, body: JSON.stringify(body) },
     JOB_TIMEOUT_MS
   );
 
   const text = await res.text().catch(() => "");
   if (!res.ok) {
-    return {
-      ok: false,
-      code: `webhook_failed_http_${res.status}`,
-      detail: text.slice(0, 500),
-      meta: { action: effectiveAction, symbol: effectiveSymbol, intent_id: intentId, trade_id: tradeId },
-    };
-  }
-
-  // give ladder-bot a moment (some executors write after response)
-  if (isExitAction(effectiveAction) && tradeId) {
-    await sleep(1200);
-    const stillOpen = await isTradeStillOpen(tradeId);
-    if (stillOpen === true) {
-      return {
-        ok: false,
-        code: "postcheck_trade_still_open",
-        detail: `Exit webhook returned 200 but trade still open: ${tradeId}`,
-        meta: { action: effectiveAction, symbol: effectiveSymbol, intent_id: intentId, trade_id: tradeId },
-      };
-    }
+    return { ok: false, code: `webhook_failed_http_${res.status}`, detail: text.slice(0, 500) };
   }
 
   return { ok: true, code: "ok", detail: text.slice(0, 500) };
@@ -379,6 +295,7 @@ async function loop() {
 
       const claimed = await claimJob(candidate.id);
       if (!claimed) {
+        // race condition: another worker took it
         await sleep(250);
         continue;
       }
@@ -389,6 +306,7 @@ async function loop() {
         ts: nowIso(),
         id: claimed.id,
         type: claimed.type,
+        run_at: claimed.run_at || null,
         claimed_by: claimed.claimed_by,
         last_step: claimed.last_step,
       });
@@ -408,7 +326,6 @@ async function loop() {
           type: claimed.type,
           last_error: result.code,
           detail: result.detail,
-          meta: result.meta || null,
         });
       }
 
