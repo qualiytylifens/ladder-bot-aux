@@ -73,7 +73,6 @@ function safeTrim(v) {
 }
 
 function normalizeWebhookUrl(u) {
-  // normalize minor mistakes like trailing spaces
   return safeTrim(u);
 }
 
@@ -244,7 +243,6 @@ async function fetchIntent(intentId) {
 function extractTradeId(intent) {
   const rs = intent && intent.raw_signal ? intent.raw_signal : null;
   if (!rs || typeof rs !== "object") return null;
-  // tolerate naming differences
   return (
     rs.trade_id ||
     rs.tradeId ||
@@ -256,7 +254,7 @@ function extractTradeId(intent) {
 }
 
 async function isTradeStillOpen(tradeId) {
-  if (!tradeId) return null; // unknown
+  if (!tradeId) return null;
   const { data, error } = await sb
     .from("trades_prod")
     .select("id,status,closed_at")
@@ -265,8 +263,7 @@ async function isTradeStillOpen(tradeId) {
 
   if (error) throw error;
   if (!data || !data[0]) return null;
-  const row = data[0];
-  return String(row.status || "").toLowerCase() === "open";
+  return String(data[0].status || "").toLowerCase() === "open";
 }
 
 // ---------- webhook execution ----------
@@ -280,7 +277,6 @@ async function executeViaWebhook(job) {
   const action = p.action || null;
   const symbol = p.symbol || null;
 
-  // Pull authoritative intent details (so we can provide trade_id + normalized fields)
   let intent = null;
   if (intentId) {
     intent = await fetchIntent(intentId);
@@ -291,15 +287,21 @@ async function executeViaWebhook(job) {
   const executionMode = (intent && intent.execution_mode) ? intent.execution_mode : (p.execution_mode || p.mode || "paper");
   const tradeId = extractTradeId(intent) || p.trade_id || p.tradeId || null;
 
-  // 🔥 Critical: flatten fields for ladder-bot compatibility
-  // Keep payload nested too, for backward compatibility / debugging.
-  const body = {
-    // expected by most ladder-bot implementations
+  // ✅ CRITICAL: ensure ladder-bot can read everything from payload OR top-level
+  const payloadOut = {
+    ...(job.payload || {}),
     action: effectiveAction,
     symbol: effectiveSymbol,
     intent_id: intentId,
+    trade_id: tradeId,
+    execution_mode: executionMode,
+  };
 
-    // required for reliable paper closes
+  const body = {
+    // common ladder-bot style (flattened)
+    action: effectiveAction,
+    symbol: effectiveSymbol,
+    intent_id: intentId,
     trade_id: tradeId,
     execution_mode: executionMode,
 
@@ -309,8 +311,10 @@ async function executeViaWebhook(job) {
     worker_id: WORKER_ID,
     ts: nowIso(),
 
-    // keep original payload for compatibility
-    payload: job.payload || {},
+    // compatibility: many handlers only read this
+    payload: payloadOut,
+
+    // debug only
     intent_snapshot: intent ? { id: intent.id, status: intent.status, reason: intent.reason, created_at: intent.created_at } : null,
   };
 
@@ -344,11 +348,9 @@ async function executeViaWebhook(job) {
     };
   }
 
-  // Post-check: for exits, ensure trade actually closes (prevents silent no-op completes)
+  // give ladder-bot a moment (some executors write after response)
   if (isExitAction(effectiveAction) && tradeId) {
-    // small delay to allow ladder-bot to write trade update/execution rows
-    await sleep(400);
-
+    await sleep(1200);
     const stillOpen = await isTradeStillOpen(tradeId);
     if (stillOpen === true) {
       return {
