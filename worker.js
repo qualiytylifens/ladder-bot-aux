@@ -1,31 +1,33 @@
 /**
  * worker.js (CommonJS)
- * Production-safe execution worker for Railway (Supabase-backed job queue).
+ * Production-safe execution worker for Railway + Supabase.
  *
- * Purpose:
- *  - Polls execution_jobs for runnable queued jobs (by type)
- *  - Claims → POSTs to ladder-bot worker webhook → completes or fails job
- *  - Prints HARD diagnostics (QUEUE_AUDIT + PICK_DEBUG) so we never guess again
+ * Core job: claim execution_jobs(status='queued') and POST to WORKER_WEBHOOK_URL.
  *
- * Env vars expected (Railway):
+ * Optional emergency mode (OFF by default):
+ *   ENQUEUE_FROM_APPROVED=1
+ *   -> backfills execution_jobs from execution_intents(status='approved')
+ *
+ * Env vars expected:
  *  - SUPABASE_URL
  *  - SUPABASE_SERVICE_KEY
- *  - WORKER_ENABLED           (1/0 or true/false)
- *  - WORKER_ID               (e.g. ladder-worker-1)
- *  - TYPES or WORKER_TYPES   (default: execute_intent)
- *  - POLL_MS                 (default: 2000)
- *  - HEARTBEAT_SECS          (default: 20)
- *  - JOB_TIMEOUT_MS          (default: 60000)
- *  - MAX_ATTEMPTS            (default: 3)
- *  - RETRY_BACKOFF_MS        (default: 5000)
- *  - WORKER_WEBHOOK_URL      (full endpoint, e.g. https://ladder-bot.../webhook/worker)
- *  - API_SECRET              (must match ladder-bot API_SECRET)
+ *  - WORKER_ENABLED
+ *  - WORKER_ID
+ *  - TYPES
+ *  - POLL_MS
+ *  - HEARTBEAT_SECS
+ *  - JOB_TIMEOUT_MS
+ *  - WORKER_WEBHOOK_URL
+ *  - API_SECRET
+ *
+ * Optional:
+ *  - ENQUEUE_FROM_APPROVED (default 0)
+ *  - ENQUEUE_BATCH (default 25)
  */
 
 const { createClient } = require("@supabase/supabase-js");
-const { URL } = require("url");
 
-// ---------------- helpers ----------------
+// ---------- helpers ----------
 function nowIso() {
   return new Date().toISOString();
 }
@@ -50,29 +52,19 @@ function envInt(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-function safeTrim(v) {
-  return String(v || "").trim();
-}
-
 function parseTypes(raw) {
   if (!raw) return ["execute_intent"];
   const s = String(raw).trim();
-
-  // JSON array form
   if (s.startsWith("[")) {
     try {
       const arr = JSON.parse(s);
       if (Array.isArray(arr) && arr.length) return arr.map(String);
     } catch {}
   }
-
-  // Comma/space separated form
-  const out = s
+  return s
     .split(/[,\s]+/g)
     .map((x) => x.trim())
     .filter(Boolean);
-
-  return out.length ? out : ["execute_intent"];
 }
 
 async function fetchWithTimeout(url, opts, timeoutMs) {
@@ -86,53 +78,48 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   }
 }
 
+function safeTrim(v) {
+  return String(v || "").trim();
+}
+
 function normalizeWebhookUrl(u) {
   return safeTrim(u);
 }
 
-function hostOf(maybeUrl) {
+function hostFromUrl(u) {
   try {
-    return new URL(maybeUrl).host;
+    return new URL(u).host;
   } catch {
     return null;
   }
 }
 
-function prefixOfUrl(maybeUrl) {
-  try {
-    const u = new URL(maybeUrl);
-    return `${u.protocol}//${u.host}${u.pathname}`.slice(0, 48) + (u.pathname.length > 20 ? "..." : "");
-  } catch {
-    return null;
-  }
-}
-
-// ---------------- config ----------------
+// ---------- config ----------
 const TAG = "AUX";
-
 const WORKER_ENABLED = envBool("WORKER_ENABLED", true);
-const WORKER_ID = safeTrim(process.env.WORKER_ID || "ladder-worker-1");
-
-// Prefer WORKER_TYPES if set, else TYPES
-const TYPES = parseTypes(process.env.WORKER_TYPES || process.env.TYPES || "execute_intent");
-
+const WORKER_ID = process.env.WORKER_ID || "ladder-worker-1";
+const TYPES = parseTypes(process.env.TYPES || "execute_intent");
 const POLL_MS = envInt("POLL_MS", 2000);
 const HEARTBEAT_SECS = envInt("HEARTBEAT_SECS", 20);
 const JOB_TIMEOUT_MS = envInt("JOB_TIMEOUT_MS", 60000);
 
-const MAX_ATTEMPTS = envInt("MAX_ATTEMPTS", 3);
-const RETRY_BACKOFF_MS = envInt("RETRY_BACKOFF_MS", 5000);
+const ENQUEUE_FROM_APPROVED = envBool("ENQUEUE_FROM_APPROVED", false);
+const ENQUEUE_BATCH = envInt("ENQUEUE_BATCH", 25);
 
-const SUPABASE_URL = safeTrim(process.env.SUPABASE_URL || "");
-const SUPABASE_SERVICE_KEY = safeTrim(process.env.SUPABASE_SERVICE_KEY || "");
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
 
-const WORKER_WEBHOOK_URL = normalizeWebhookUrl(process.env.WORKER_WEBHOOK_URL || process.env.WEBHOOK_URL || "");
+const WORKER_WEBHOOK_URL = normalizeWebhookUrl(process.env.WORKER_WEBHOOK_URL || "");
 const API_SECRET = safeTrim(process.env.API_SECRET || "");
 
 const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
 const hasApiSecret = Boolean(API_SECRET);
 
+const supabaseHost = hostFromUrl(SUPABASE_URL);
+const webhookHost = hostFromUrl(WORKER_WEBHOOK_URL);
+
+// ---------- start log ----------
 log({
   tag: TAG,
   msg: "WORKER_STARTED",
@@ -143,14 +130,14 @@ log({
   POLL_MS,
   HEARTBEAT_SECS,
   JOB_TIMEOUT_MS,
-  MAX_ATTEMPTS,
-  RETRY_BACKOFF_MS,
+  ENQUEUE_FROM_APPROVED,
+  ENQUEUE_BATCH,
   hasSupabase,
   hasWebhook,
   hasApiSecret,
-  supabase_host: hostOf(SUPABASE_URL),
-  webhook_host: hostOf(WORKER_WEBHOOK_URL),
-  webhook_url_prefix: prefixOfUrl(WORKER_WEBHOOK_URL),
+  supabase_host: supabaseHost,
+  webhook_host: webhookHost,
+  webhook_url_prefix: WORKER_WEBHOOK_URL ? WORKER_WEBHOOK_URL.slice(0, 45) : null,
 });
 
 // If disabled, exit cleanly
@@ -175,7 +162,7 @@ if (!hasWebhook) {
     tag: TAG,
     msg: "WARN_MISSING_WEBHOOK_URL",
     ts: nowIso(),
-    hint: "Set WORKER_WEBHOOK_URL to ladder-bot worker endpoint (full path, e.g. /webhook/worker)",
+    hint: "Set WORKER_WEBHOOK_URL to ladder-bot executor endpoint (usually /webhook/worker)",
   });
 }
 
@@ -188,133 +175,192 @@ if (hasWebhook && !hasApiSecret) {
   });
 }
 
-// ---------------- supabase client ----------------
+// ---------- supabase client ----------
 const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
 });
 
-// ---------------- diagnostics (NO GUESSING) ----------------
-let lastAuditAt = 0;
-const AUDIT_EVERY_MS = 10_000;
+// ---------- queue audit (debug, safe) ----------
+async function queueAudit() {
+  try {
+    // job counts
+    const { data: jobCounts, error: e1 } = await sb
+      .from("execution_jobs")
+      .select("status", { count: "exact", head: false })
+      .in("status", ["queued", "running", "completed", "failed", "archived", "cancelled"]);
 
-async function queueAudit(types) {
-  // Count jobs by status (fast + reliable with head:true)
-  const statuses = ["queued", "running", "completed", "failed", "archived", "cancelled"];
-  const statusCounts = {};
-  for (const st of statuses) {
-    const { count, error } = await sb
+    if (e1) throw e1;
+
+    // Summarize via separate count queries (more reliable than group aggregation in PostgREST)
+    async function countJobsByStatus(status) {
+      const { count, error } = await sb
+        .from("execution_jobs")
+        .select("id", { count: "exact", head: true })
+        .eq("status", status);
+      if (error) throw error;
+      return count || 0;
+    }
+
+    const statusCounts = {
+      queued: await countJobsByStatus("queued"),
+      running: await countJobsByStatus("running"),
+      completed: await countJobsByStatus("completed"),
+      failed: await countJobsByStatus("failed"),
+      archived: await countJobsByStatus("archived"),
+      cancelled: await countJobsByStatus("cancelled"),
+    };
+
+    // queued for types
+    const { count: queuedForTypes, error: e2 } = await sb
       .from("execution_jobs")
       .select("id", { count: "exact", head: true })
-      .eq("status", st);
-    if (error) throw error;
-    statusCounts[st] = count ?? null;
-  }
+      .eq("status", "queued")
+      .is("claimed_by", null)
+      .in("type", TYPES);
+    if (e2) throw e2;
 
-  // Count queued jobs for our TYPES
-  const { count: queuedForTypes, error: eQueuedTypes } = await sb
-    .from("execution_jobs")
-    .select("id", { count: "exact", head: true })
-    .eq("status", "queued")
-    .is("claimed_by", null)
-    .in("type", types);
-  if (eQueuedTypes) throw eQueuedTypes;
+    // intents counts (quick signal)
+    async function countIntentsByStatus(status) {
+      const { count, error } = await sb
+        .from("execution_intents")
+        .select("id", { count: "exact", head: true })
+        .eq("status", status);
+      if (error) throw error;
+      return count || 0;
+    }
 
-  // Recent jobs (last 10)
-  const { data: recentJobs, error: eRecent } = await sb
-    .from("execution_jobs")
-    .select("id,type,status,claimed_by,run_at,created_at,last_error,last_step,attempts")
-    .order("created_at", { ascending: false })
-    .limit(10);
-  if (eRecent) throw eRecent;
+    const pendingIntents = await countIntentsByStatus("pending");
+    const approvedIntents = await countIntentsByStatus("approved");
 
-  // Intents visibility (helps prove upstream enqueue)
-  let pendingIntents = null;
-  let approvedIntents = null;
-  try {
-    const a = await sb.from("execution_intents").select("id", { count: "exact", head: true }).eq("status", "pending");
-    if (!a.error) pendingIntents = a.count ?? null;
-
-    const b = await sb.from("execution_intents").select("id", { count: "exact", head: true }).eq("status", "approved");
-    if (!b.error) approvedIntents = b.count ?? null;
-  } catch {}
-
-  // Oldest runnable run_at (queued/unclaimed for our types)
-  let oldestRunAt = null;
-  try {
-    const { data } = await sb
+    // oldest run_at among queued
+    const { data: oldest, error: e3 } = await sb
       .from("execution_jobs")
       .select("run_at")
       .eq("status", "queued")
-      .is("claimed_by", null)
-      .in("type", types)
-      .order("run_at", { ascending: true, nullsFirst: true })
+      .order("run_at", { ascending: true })
       .limit(1);
-    if (data && data[0]) oldestRunAt = data[0].run_at ?? null;
-  } catch {}
+    if (e3) throw e3;
+
+    // recent jobs sample
+    const { data: recentJobs, error: e4 } = await sb
+      .from("execution_jobs")
+      .select("id,type,status,claimed_by,run_at,created_at,attempts,last_step,last_error")
+      .order("created_at", { ascending: false })
+      .limit(5);
+    if (e4) throw e4;
+
+    log({
+      tag: TAG,
+      msg: "QUEUE_AUDIT",
+      ts: nowIso(),
+      types: TYPES,
+      statusCounts,
+      queuedForTypes: queuedForTypes || 0,
+      pendingIntents,
+      approvedIntents,
+      oldest_run_at: oldest && oldest[0] ? oldest[0].run_at : null,
+      recentJobs: (recentJobs || []).map((j) => ({
+        id: j.id,
+        type: j.type,
+        status: j.status,
+        claimed_by: j.claimed_by,
+        run_at: j.run_at,
+        created_at: j.created_at,
+        attempts: j.attempts,
+        last_step: j.last_step,
+        last_error: j.last_error,
+      })),
+    });
+  } catch (err) {
+    log({
+      tag: TAG,
+      msg: "QUEUE_AUDIT_ERROR",
+      ts: nowIso(),
+      error: String(err && err.message ? err.message : err),
+    });
+  }
+}
+
+// ---------- emergency: enqueue jobs from approved intents ----------
+async function enqueueFromApproved(maxBatch) {
+  if (!ENQUEUE_FROM_APPROVED) return 0;
+
+  // Pull a batch of approved intents
+  const { data: intents, error: e1 } = await sb
+    .from("execution_intents")
+    .select("id,action,symbol,execution_mode,created_at")
+    .eq("status", "approved")
+    .order("created_at", { ascending: true })
+    .limit(maxBatch);
+
+  if (e1) throw e1;
+  if (!intents || intents.length === 0) return 0;
+
+  const intentIds = intents.map((x) => x.id);
+
+  // Find which already have jobs
+  const { data: existing, error: e2 } = await sb
+    .from("execution_jobs")
+    .select("intent_id")
+    .in("intent_id", intentIds);
+  if (e2) throw e2;
+
+  const existingSet = new Set((existing || []).map((x) => x.intent_id));
+  const missing = intents.filter((i) => !existingSet.has(i.id));
+  if (missing.length === 0) return 0;
+
+  const now = nowIso();
+  const rows = missing.map((i) => ({
+    // id omitted -> db default uuid
+    created_at: now, // safe even if db has default
+    run_at: now,
+    intent_id: i.id,
+    type: "execute_intent",
+    payload: {
+      intent_id: i.id,
+      action: i.action,
+      symbol: i.symbol,
+      execution_mode: i.execution_mode || "paper",
+      created_from: "worker_enqueue_from_approved",
+    },
+    status: "queued",
+    attempts: 0,
+    last_error: null,
+    claimed_by: null,
+    claimed_at: null,
+    heartbeat_at: null,
+    run_id: null,
+    last_step: "enqueued_by_worker",
+  }));
+
+  const { error: e3 } = await sb.from("execution_jobs").insert(rows);
+  if (e3) throw e3;
 
   log({
     tag: TAG,
-    msg: "QUEUE_AUDIT",
+    msg: "ENQUEUE_FROM_APPROVED",
     ts: nowIso(),
-    types,
-    statusCounts,
-    queuedForTypes: queuedForTypes ?? null,
-    pendingIntents,
-    approvedIntents,
-    oldest_run_at: oldestRunAt,
-    recentJobs: (recentJobs || []).map((j) => ({
-      id: j.id,
-      type: j.type,
-      status: j.status,
-      claimed_by: j.claimed_by,
-      run_at: j.run_at,
-      created_at: j.created_at,
-      attempts: j.attempts,
-      last_step: j.last_step,
-      last_error: j.last_error ? String(j.last_error).slice(0, 120) : null,
-    })),
+    requested: intents.length,
+    missing: missing.length,
+    inserted: rows.length,
   });
+
+  return rows.length;
 }
 
-// ---------------- core DB ops ----------------
-function isRunnable(job) {
-  // runnable if run_at is null OR run_at <= now
-  if (!job) return false;
-  if (!job.run_at) return true;
-  const t = Date.parse(job.run_at);
-  if (!Number.isFinite(t)) return true;
-  return t <= Date.now();
-}
-
+// ---------- core DB ops ----------
 async function pickQueuedJob(types) {
-  // Fetch a small window, then pick first runnable locally.
-  // This avoids SQL operator issues on run_at and keeps it compatible across schemas.
   const { data, error } = await sb
     .from("execution_jobs")
-    .select("id,type,status,payload,attempts,created_at,run_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
+    .select("id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step")
     .in("type", types)
     .eq("status", "queued")
     .is("claimed_by", null)
-    .order("run_at", { ascending: true, nullsFirst: true })
     .order("created_at", { ascending: true })
-    .limit(25);
+    .limit(1);
 
   if (error) throw error;
-
-  const list = Array.isArray(data) ? data : [];
-  const runnable = list.find(isRunnable) || null;
-
-  // PICK_DEBUG exactly like your logs
-  log({
-    tag: TAG,
-    msg: "PICK_DEBUG",
-    ts: nowIso(),
-    queued_seen: list.length,
-    oldest_run_at: list.length ? (list[0].run_at ?? null) : null,
-    runnable_found: Boolean(runnable),
-  });
-
-  return runnable;
+  return data && data[0] ? data[0] : null;
 }
 
 async function claimJob(jobId) {
@@ -332,25 +378,11 @@ async function claimJob(jobId) {
     .eq("id", jobId)
     .eq("status", "queued")
     .is("claimed_by", null)
-    .select("id,type,status,payload,attempts,created_at,run_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
+    .select("id,type,status,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
     .limit(1);
 
   if (error) throw error;
   return data && data[0] ? data[0] : null;
-}
-
-async function touchHeartbeat(jobId) {
-  const now = nowIso();
-  const { error } = await sb
-    .from("execution_jobs")
-    .update({
-      heartbeat_at: now,
-      last_step: "heartbeat",
-    })
-    .eq("id", jobId)
-    .eq("claimed_by", WORKER_ID)
-    .in("status", ["running"]);
-  if (error) throw error;
 }
 
 async function completeJob(jobId) {
@@ -370,41 +402,21 @@ async function completeJob(jobId) {
 
 async function failJob(jobId, lastErrorCode) {
   const now = nowIso();
-
-  // Get current attempts so we can decide retry/failed
-  const { data: cur, error: eCur } = await sb
+  const { error } = await sb
     .from("execution_jobs")
-    .select("id,attempts")
+    .update({
+      status: "failed",
+      heartbeat_at: now,
+      last_step: "failed",
+      last_error: lastErrorCode || "unknown_error",
+    })
     .eq("id", jobId)
-    .limit(1);
-  if (eCur) throw eCur;
-
-  const attempts = (cur && cur[0] && Number.isFinite(cur[0].attempts)) ? cur[0].attempts : 0;
-  const nextAttempts = attempts + 1;
-
-  const shouldRetry = nextAttempts < MAX_ATTEMPTS;
-
-  const patch = {
-    attempts: nextAttempts,
-    heartbeat_at: now,
-    last_step: shouldRetry ? "retry_scheduled" : "failed",
-    last_error: lastErrorCode || "unknown_error",
-    status: shouldRetry ? "queued" : "failed",
-    claimed_by: shouldRetry ? null : WORKER_ID,
-    claimed_at: shouldRetry ? null : now,
-  };
-
-  if (shouldRetry) {
-    // backoff
-    patch.run_at = new Date(Date.now() + RETRY_BACKOFF_MS).toISOString();
-  }
-
-  const { error } = await sb.from("execution_jobs").update(patch).eq("id", jobId);
+    .eq("claimed_by", WORKER_ID);
 
   if (error) throw error;
 }
 
-// ---------------- webhook execution ----------------
+// ---------- webhook execution ----------
 async function executeViaWebhook(job) {
   if (!hasWebhook) {
     return { ok: false, code: "missing_webhook_url", detail: "WORKER_WEBHOOK_URL not set" };
@@ -428,58 +440,53 @@ async function executeViaWebhook(job) {
     headers["authorization"] = `Bearer ${API_SECRET}`;
   }
 
-  // Heartbeat timer
-  let hb = null;
-  try {
-    hb = setInterval(() => {
-      touchHeartbeat(job.id).catch(() => {});
-    }, Math.max(5000, HEARTBEAT_SECS * 1000));
-  } catch {}
+  const res = await fetchWithTimeout(
+    WORKER_WEBHOOK_URL,
+    { method: "POST", headers, body: JSON.stringify(body) },
+    JOB_TIMEOUT_MS
+  );
 
-  try {
-    const res = await fetchWithTimeout(
-      WORKER_WEBHOOK_URL,
-      {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-      },
-      JOB_TIMEOUT_MS
-    );
-
-    const text = await res.text().catch(() => "");
-    if (!res.ok) {
-      return {
-        ok: false,
-        code: `webhook_failed_http_${res.status}`,
-        detail: text.slice(0, 500),
-      };
-    }
-
-    return { ok: true, code: "ok", detail: text.slice(0, 500) };
-  } catch (err) {
-    const msg = String(err && err.message ? err.message : err);
-    return { ok: false, code: "webhook_failed_exception", detail: msg.slice(0, 500) };
-  } finally {
-    if (hb) clearInterval(hb);
+  const text = await res.text().catch(() => "");
+  if (!res.ok) {
+    return {
+      ok: false,
+      code: `webhook_failed_http_${res.status}`,
+      detail: text.slice(0, 500),
+    };
   }
+
+  return { ok: true, code: "ok", detail: text.slice(0, 500) };
 }
 
-// ---------------- main loop ----------------
+// ---------- main loop ----------
+let lastAuditAt = 0;
+
 async function loop() {
   while (true) {
     try {
       log({ tag: TAG, msg: "POLL", ts: nowIso(), types: TYPES });
 
-      // periodic deep audit
-      const now = Date.now();
-      if (now - lastAuditAt > AUDIT_EVERY_MS) {
-        lastAuditAt = now;
-        await queueAudit(TYPES);
+      // audit every ~15s (enough to debug, not spam)
+      const nowMs = Date.now();
+      if (nowMs - lastAuditAt > 15000) {
+        lastAuditAt = nowMs;
+        await queueAudit();
       }
+
+      // If queue is empty but we have approved intents, this restores the pipeline.
+      // Safe: only inserts missing jobs; does not modify intents/trades.
+      await enqueueFromApproved(ENQUEUE_BATCH);
 
       const candidate = await pickQueuedJob(TYPES);
       if (!candidate) {
+        log({
+          tag: TAG,
+          msg: "PICK_DEBUG",
+          ts: nowIso(),
+          queued_seen: 0,
+          oldest_run_at: null,
+          runnable_found: false,
+        });
         await sleep(POLL_MS);
         continue;
       }
