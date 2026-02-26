@@ -1,14 +1,10 @@
 /**
  * worker.js (CommonJS)
- * Institutional-grade execution worker for Railway + Supabase.
+ * Production-safe execution worker for Railway + Supabase.
  *
- * Core job:
- *  - Claim execution_jobs(status='queued') that are runnable now
- *  - POST to executor webhook
- *  - Treat non-200 as fail
- *  - ALSO treat 200 responses that contain executor-side failure signals as fail
- *
- * This file is for ladder-worker (NOT ladder-bot).
+ * Key debug goals:
+ *  - If queue is empty: prove it with counts
+ *  - If ENQUEUE_FROM_APPROVED=1: show why enqueue didn't insert
  */
 
 const { createClient } = require("@supabase/supabase-js");
@@ -83,25 +79,24 @@ const TAG = "AUX";
 const WORKER_ENABLED = envBool("WORKER_ENABLED", true);
 const WORKER_ID = safeTrim(process.env.WORKER_ID) || "ladder-worker-1";
 
-// Support TYPES + WORKER_TYPES
+// support TYPES + WORKER_TYPES
 const TYPES = parseTypes(process.env.WORKER_TYPES || process.env.TYPES || "execute_intent");
 
 const POLL_MS = envInt("POLL_MS", 2000);
 const HEARTBEAT_SECS = envInt("HEARTBEAT_SECS", 20);
 const JOB_TIMEOUT_MS = envInt("JOB_TIMEOUT_MS", 60000);
 
-// Optional emergency mode (OFF by default)
-const ENQUEUE_FROM_APPROVED = envBool("ENQUEUE_FROM_APPROVED", false);
-const ENQUEUE_BATCH = envInt("ENQUEUE_BATCH", 25);
-
-// Retries
 const MAX_ATTEMPTS = envInt("MAX_ATTEMPTS", 3);
 const RETRY_BACKOFF_MS = envInt("RETRY_BACKOFF_MS", 5000);
+
+// emergency backfill
+const ENQUEUE_FROM_APPROVED = envBool("ENQUEUE_FROM_APPROVED", false);
+const ENQUEUE_BATCH = envInt("ENQUEUE_BATCH", 25);
 
 const SUPABASE_URL = safeTrim(process.env.SUPABASE_URL || "");
 const SUPABASE_SERVICE_KEY = safeTrim(process.env.SUPABASE_SERVICE_KEY || "");
 
-// Webhook URL compatibility (use the most explicit first)
+// webhook URL compatibility
 const WORKER_WEBHOOK_URL = normalizeWebhookUrl(
   process.env.WORKER_WEBHOOK_URL ||
     process.env.WEBHOOK_URL ||
@@ -169,7 +164,7 @@ if (!hasApiSecret) {
     tag: TAG,
     msg: "FATAL_MISSING_API_SECRET",
     ts: nowIso(),
-    hint: "Set API_SECRET (must match ladder-bot API_SECRET) to avoid auth failures",
+    hint: "Set API_SECRET (must match ladder-bot API_SECRET)",
   });
   process.exit(1);
 }
@@ -179,10 +174,49 @@ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
 });
 
-// ---------- emergency: enqueue jobs from approved intents ----------
+// ---------- debug helpers ----------
+async function countQueuedForTypes() {
+  const { count, error } = await sb
+    .from("execution_jobs")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "queued")
+    .in("type", TYPES);
+  if (error) throw error;
+  return count || 0;
+}
+
+async function countUnclaimedRunnableNow() {
+  const now = nowIso();
+  // Supabase "or" filters are string-based; we keep it simple:
+  // queued AND (claimed_by null OR '') AND (run_at null OR run_at <= now)
+  const { count, error } = await sb
+    .from("execution_jobs")
+    .select("id", { count: "exact", head: true })
+    .eq("status", "queued")
+    .in("type", TYPES)
+    .or("claimed_by.is.null,claimed_by.eq.")
+    .or(`run_at.is.null,run_at.lte.${now}`);
+  if (error) throw error;
+  return count || 0;
+}
+
+async function oldestQueuedRunAt() {
+  const { data, error } = await sb
+    .from("execution_jobs")
+    .select("run_at")
+    .eq("status", "queued")
+    .in("type", TYPES)
+    .order("run_at", { ascending: true })
+    .limit(1);
+  if (error) throw error;
+  return data && data[0] ? data[0].run_at : null;
+}
+
+// ---------- emergency: enqueue jobs from approved intents (NOW WITH DEBUG) ----------
 async function enqueueFromApproved(maxBatch) {
   if (!ENQUEUE_FROM_APPROVED) return 0;
 
+  // Pull a batch of approved intents
   const { data: intents, error: e1 } = await sb
     .from("execution_intents")
     .select("id,action,symbol,execution_mode,created_at")
@@ -190,8 +224,16 @@ async function enqueueFromApproved(maxBatch) {
     .order("created_at", { ascending: true })
     .limit(maxBatch);
 
-  if (e1) throw e1;
-  if (!intents || intents.length === 0) return 0;
+  if (e1) {
+    log({ tag: TAG, msg: "ENQUEUE_DEBUG_ERROR", ts: nowIso(), step: "select_approved", error: String(e1.message || e1) });
+    return 0;
+  }
+
+  const approvedCount = intents ? intents.length : 0;
+  if (!intents || intents.length === 0) {
+    log({ tag: TAG, msg: "ENQUEUE_DEBUG", ts: nowIso(), approved_batch: 0, already_have_jobs: 0, missing_jobs: 0, inserted: 0 });
+    return 0;
+  }
 
   const intentIds = intents.map((x) => x.id);
 
@@ -199,11 +241,28 @@ async function enqueueFromApproved(maxBatch) {
     .from("execution_jobs")
     .select("intent_id")
     .in("intent_id", intentIds);
-  if (e2) throw e2;
+
+  if (e2) {
+    log({ tag: TAG, msg: "ENQUEUE_DEBUG_ERROR", ts: nowIso(), step: "select_existing_jobs", error: String(e2.message || e2) });
+    return 0;
+  }
 
   const existingSet = new Set((existing || []).map((x) => x.intent_id));
   const missing = intents.filter((i) => !existingSet.has(i.id));
-  if (missing.length === 0) return 0;
+
+  if (missing.length === 0) {
+    log({
+      tag: TAG,
+      msg: "ENQUEUE_DEBUG",
+      ts: nowIso(),
+      approved_batch: approvedCount,
+      already_have_jobs: approvedCount,
+      missing_jobs: 0,
+      inserted: 0,
+      note: "All approved intents already have execution_jobs",
+    });
+    return 0;
+  }
 
   const now = nowIso();
   const rows = missing.map((i) => ({
@@ -228,14 +287,27 @@ async function enqueueFromApproved(maxBatch) {
   }));
 
   const { error: e3 } = await sb.from("execution_jobs").insert(rows);
-  if (e3) throw e3;
+
+  if (e3) {
+    log({
+      tag: TAG,
+      msg: "ENQUEUE_DEBUG_ERROR",
+      ts: nowIso(),
+      step: "insert_jobs",
+      approved_batch: approvedCount,
+      missing_jobs: missing.length,
+      error: String(e3.message || e3),
+    });
+    return 0;
+  }
 
   log({
     tag: TAG,
-    msg: "ENQUEUE_FROM_APPROVED",
+    msg: "ENQUEUE_DEBUG",
     ts: nowIso(),
-    requested: intents.length,
-    missing: missing.length,
+    approved_batch: approvedCount,
+    already_have_jobs: approvedCount - missing.length,
+    missing_jobs: missing.length,
     inserted: rows.length,
   });
 
@@ -243,15 +315,13 @@ async function enqueueFromApproved(maxBatch) {
 }
 
 // ---------- core DB ops ----------
-// IMPORTANT: include BOTH claimed_by IS NULL and claimed_by = ''
-// IMPORTANT: include run_at <= now (or run_at is null)
-async function pickQueuedJob(types) {
+async function pickQueuedJob() {
   const now = nowIso();
 
   const { data, error } = await sb
     .from("execution_jobs")
     .select("id,type,status,payload,attempts,created_at,run_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
-    .in("type", types)
+    .in("type", TYPES)
     .eq("status", "queued")
     .or("claimed_by.is.null,claimed_by.eq.")
     .or(`run_at.is.null,run_at.lte.${now}`)
@@ -286,30 +356,13 @@ async function claimJob(jobId) {
   return data && data[0] ? data[0] : null;
 }
 
-async function setHeartbeat(jobId) {
-  const now = nowIso();
-  const { error } = await sb
-    .from("execution_jobs")
-    .update({ heartbeat_at: now, last_step: "heartbeat" })
-    .eq("id", jobId)
-    .eq("claimed_by", WORKER_ID)
-    .in("status", ["running"]);
-  if (error) throw error;
-}
-
 async function completeJob(jobId) {
   const now = nowIso();
   const { error } = await sb
     .from("execution_jobs")
-    .update({
-      status: "completed",
-      heartbeat_at: now,
-      last_step: "completed",
-      last_error: null,
-    })
+    .update({ status: "completed", heartbeat_at: now, last_step: "completed", last_error: null })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
-
   if (error) throw error;
 }
 
@@ -319,7 +372,7 @@ async function requeueJob(jobId, attempts, lastErrorCode) {
     .from("execution_jobs")
     .update({
       status: "queued",
-      attempts: attempts,
+      attempts,
       last_error: lastErrorCode || "unknown_error",
       last_step: "requeued",
       heartbeat_at: now,
@@ -329,7 +382,6 @@ async function requeueJob(jobId, attempts, lastErrorCode) {
     })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
-
   if (error) throw error;
 }
 
@@ -337,21 +389,13 @@ async function failJob(jobId, attempts, lastErrorCode) {
   const now = nowIso();
   const { error } = await sb
     .from("execution_jobs")
-    .update({
-      status: "failed",
-      attempts: attempts,
-      heartbeat_at: now,
-      last_step: "failed",
-      last_error: lastErrorCode || "unknown_error",
-    })
+    .update({ status: "failed", attempts, heartbeat_at: now, last_step: "failed", last_error: lastErrorCode || "unknown_error" })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
-
   if (error) throw error;
 }
 
 // ---------- webhook execution ----------
-// Treat HTTP 200 with "soft fail" body as a FAIL.
 async function executeViaWebhook(job) {
   const body = {
     job_id: job.id,
@@ -368,54 +412,32 @@ async function executeViaWebhook(job) {
     authorization: `Bearer ${API_SECRET}`,
   };
 
-  const hbInterval = setInterval(() => {
-    setHeartbeat(job.id).catch(() => {});
-  }, Math.max(2000, HEARTBEAT_SECS * 1000));
+  const res = await fetchWithTimeout(
+    WORKER_WEBHOOK_URL,
+    { method: "POST", headers, body: JSON.stringify(body) },
+    JOB_TIMEOUT_MS
+  );
 
-  try {
-    const res = await fetchWithTimeout(
-      WORKER_WEBHOOK_URL,
-      { method: "POST", headers, body: JSON.stringify(body) },
-      JOB_TIMEOUT_MS
-    );
+  const text = await res.text().catch(() => "");
+  const json = tryParseJson(text);
 
-    const text = await res.text().catch(() => "");
-    const json = tryParseJson(text);
-
-    if (!res.ok) {
-      return {
-        ok: false,
-        code: `webhook_failed_http_${res.status}`,
-        detail: text.slice(0, 500),
-      };
-    }
-
-    // soft-fail detection (HTTP 200 but executor says it failed)
-    const hay = (text || "").toLowerCase();
-    const softFail =
-      hay.includes("postcheck_trade_still_open") ||
-      hay.includes("trade still open") ||
-      hay.includes("exit webhook returned 200 but trade still open") ||
-      (json && (json.ok === false || json.success === false || json.error || json.error_code));
-
-    if (softFail) {
-      const code =
-        (json && (json.error_code || json.code)) ||
-        (hay.includes("postcheck_trade_still_open") || hay.includes("trade still open")
-          ? "postcheck_trade_still_open"
-          : "executor_soft_fail");
-
-      return {
-        ok: false,
-        code,
-        detail: (json ? JSON.stringify(json).slice(0, 500) : text.slice(0, 500)),
-      };
-    }
-
-    return { ok: true, code: "ok", detail: text.slice(0, 500) };
-  } finally {
-    clearInterval(hbInterval);
+  if (!res.ok) {
+    return { ok: false, code: `webhook_failed_http_${res.status}`, detail: text.slice(0, 500) };
   }
+
+  // Detect executor "soft fail" while still returning 200
+  const hay = (text || "").toLowerCase();
+  const softFail =
+    hay.includes("postcheck_trade_still_open") ||
+    hay.includes("trade still open") ||
+    (json && (json.ok === false || json.success === false || json.error || json.error_code));
+
+  if (softFail) {
+    const code = (json && (json.error_code || json.code)) || "executor_soft_fail";
+    return { ok: false, code, detail: (json ? JSON.stringify(json).slice(0, 500) : text.slice(0, 500)) };
+  }
+
+  return { ok: true, code: "ok", detail: text.slice(0, 500) };
 }
 
 // ---------- main loop ----------
@@ -424,19 +446,30 @@ async function loop() {
     try {
       log({ tag: TAG, msg: "POLL", ts: nowIso(), types: TYPES });
 
-      // Optional emergency backfill
+      // 1) Try emergency backfill (with debug)
       await enqueueFromApproved(ENQUEUE_BATCH);
 
-      const candidate = await pickQueuedJob(TYPES);
+      // 2) Try pick
+      const candidate = await pickQueuedJob();
 
       if (!candidate) {
+        // PROVE the state with counts
+        const [queuedTotal, unclaimedRunnable, oldestRunAt] = await Promise.all([
+          countQueuedForTypes().catch(() => null),
+          countUnclaimedRunnableNow().catch(() => null),
+          oldestQueuedRunAt().catch(() => null),
+        ]);
+
         log({
           tag: TAG,
           msg: "PICK_DEBUG",
           ts: nowIso(),
-          queued_seen: 0,
+          queued_total_for_types: queuedTotal,
+          unclaimed_runnable_now: unclaimedRunnable,
+          oldest_run_at: oldestRunAt,
           runnable_found: false,
         });
+
         await sleep(POLL_MS);
         continue;
       }
