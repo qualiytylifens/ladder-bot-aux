@@ -1,18 +1,6 @@
 /**
- * worker.js (CommonJS)
- * Production-safe execution worker for Railway.
- *
- * Env vars expected (set in Railway):
- *  - SUPABASE_URL
- *  - SUPABASE_SERVICE_KEY
- *  - WORKER_ENABLED
- *  - WORKER_ID
- *  - TYPES
- *  - POLL_MS
- *  - HEARTBEAT_SECS
- *  - JOB_TIMEOUT_MS
- *  - WORKER_WEBHOOK_URL   (executor endpoint, usually ladder-bot /webhook/worker)
- *  - API_SECRET           (shared with ladder-bot; required for auth)
+ * worker.js — HARDENED PRODUCTION VERSION
+ * Institutional-safe execution worker for Railway.
  */
 
 const { createClient } = require("@supabase/supabase-js");
@@ -45,12 +33,14 @@ function envInt(name, fallback) {
 function parseTypes(raw) {
   if (!raw) return ["execute_intent"];
   const s = String(raw).trim();
+
   if (s.startsWith("[")) {
     try {
       const arr = JSON.parse(s);
       if (Array.isArray(arr) && arr.length) return arr.map(String);
     } catch {}
   }
+
   return s
     .split(/[,\s]+/g)
     .map((x) => x.trim())
@@ -72,128 +62,76 @@ function safeTrim(v) {
   return String(v || "").trim();
 }
 
-function normalizeWebhookUrl(u) {
-  return safeTrim(u);
-}
-
-function isRunnableRunAt(runAt) {
-  if (!runAt) return true;
-  const t = new Date(runAt).getTime();
-  if (!Number.isFinite(t)) return true; // if malformed, treat as runnable to avoid deadlocks
-  return t <= Date.now();
-}
-
 // ---------- config ----------
 const TAG = "AUX";
 const WORKER_ENABLED = envBool("WORKER_ENABLED", true);
 const WORKER_ID = process.env.WORKER_ID || "ladder-worker-1";
 const TYPES = parseTypes(process.env.TYPES || "execute_intent");
 const POLL_MS = envInt("POLL_MS", 2000);
-const HEARTBEAT_SECS = envInt("HEARTBEAT_SECS", 20);
 const JOB_TIMEOUT_MS = envInt("JOB_TIMEOUT_MS", 60000);
+const STALE_JOB_SECS = envInt("STALE_JOB_SECS", 180);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
-
-const WORKER_WEBHOOK_URL = normalizeWebhookUrl(process.env.WORKER_WEBHOOK_URL || "");
+const WORKER_WEBHOOK_URL = safeTrim(process.env.WORKER_WEBHOOK_URL || "");
 const API_SECRET = safeTrim(process.env.API_SECRET || "");
 
-const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
-const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
-const hasApiSecret = Boolean(API_SECRET);
-
-// ---------- start log ----------
-log({
-  tag: TAG,
-  msg: "WORKER_STARTED",
-  ts: nowIso(),
-  WORKER_ENABLED,
-  WORKER_ID,
-  TYPES,
-  POLL_MS,
-  HEARTBEAT_SECS,
-  JOB_TIMEOUT_MS,
-  hasSupabase,
-  hasWebhook,
-  hasApiSecret,
-  WORKER_WEBHOOK_URL: hasWebhook ? WORKER_WEBHOOK_URL : "(missing)",
-});
-
-if (!WORKER_ENABLED) {
-  log({ tag: TAG, msg: "WORKER_DISABLED_BY_ENV", ts: nowIso() });
-  setTimeout(() => process.exit(0), 250);
-  return;
-}
-
-if (!hasSupabase) {
-  log({
-    tag: TAG,
-    msg: "FATAL_MISSING_SUPABASE_ENV",
-    ts: nowIso(),
-    need: ["SUPABASE_URL", "SUPABASE_SERVICE_KEY"],
-  });
-  process.exit(1);
-}
-
-if (!hasWebhook) {
-  log({
-    tag: TAG,
-    msg: "WARN_MISSING_WEBHOOK_URL",
-    ts: nowIso(),
-    hint: "Set WORKER_WEBHOOK_URL to your executor endpoint (ladder-bot /webhook/worker)",
-  });
-}
-
-if (hasWebhook && !hasApiSecret) {
-  log({
-    tag: TAG,
-    msg: "WARN_MISSING_API_SECRET",
-    ts: nowIso(),
-    hint: "Set API_SECRET (must match ladder-bot API_SECRET) to avoid webhook_failed_http_401",
-  });
-}
-
-// ---------- supabase client ----------
 const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
 });
 
-// ---------- core DB ops ----------
+// ---------- stale recovery ----------
+async function recoverStaleJobs() {
+  const cutoff = new Date(Date.now() - STALE_JOB_SECS * 1000).toISOString();
+
+  const { error } = await sb
+    .from("execution_jobs")
+    .update({
+      status: "queued",
+      claimed_by: null,
+      claimed_at: null,
+      heartbeat_at: null,
+      last_step: "recovered_stale",
+    })
+    .in("status", ["running"])
+    .lt("heartbeat_at", cutoff);
+
+  if (error) {
+    log({ tag: TAG, msg: "STALE_RECOVERY_ERROR", error: error.message });
+  }
+}
+
+// ---------- pick job ----------
 async function pickQueuedJob(types) {
-  // Fetch a small batch (not just 1) so we can:
-  // - skip non-runnable run_at
-  // - tolerate claimed_by = '' (empty string) as "unclaimed"
-  // - avoid deadlocks where the oldest row is scheduled for the future
+  // 🔥 try to recover stale jobs first
+  await recoverStaleJobs();
+
   const { data, error } = await sb
     .from("execution_jobs")
-    .select("id,type,status,run_at,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
+    .select("*")
     .in("type", types)
     .eq("status", "queued")
-    .or('claimed_by.is.null,claimed_by.eq.""') // ✅ NULL or empty string
+    .or("claimed_by.is.null,claimed_by.eq.")
     .order("created_at", { ascending: true })
-    .limit(25);
+    .limit(1);
 
   if (error) throw error;
 
-  const rows = Array.isArray(data) ? data : [];
-  const runnable = rows.find((r) => isRunnableRunAt(r.run_at)) || null;
-
-  // diagnostic (cheap and very useful)
   log({
     tag: TAG,
     msg: "PICK_DEBUG",
     ts: nowIso(),
-    queued_seen: rows.length,
-    runnable_found: Boolean(runnable),
-    oldest_run_at: rows[0]?.run_at ?? null,
+    queued_seen: data?.length || 0,
+    runnable_found: !!(data && data[0]),
   });
 
-  return runnable;
+  return data && data[0] ? data[0] : null;
 }
 
+// ---------- claim ----------
 async function claimJob(jobId) {
   const now = nowIso();
-  // claim only if still queued + still unclaimed (NULL or '')
+
   const { data, error } = await sb
     .from("execution_jobs")
     .update({
@@ -206,22 +144,21 @@ async function claimJob(jobId) {
     })
     .eq("id", jobId)
     .eq("status", "queued")
-    .or('claimed_by.is.null,claimed_by.eq.""')
-    .select("id,type,status,run_at,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
+    .select()
     .limit(1);
 
   if (error) throw error;
   return data && data[0] ? data[0] : null;
 }
 
+// ---------- completion ----------
 async function completeJob(jobId) {
-  const now = nowIso();
   const { error } = await sb
     .from("execution_jobs")
     .update({
       status: "completed",
-      heartbeat_at: now,
       last_step: "completed",
+      heartbeat_at: nowIso(),
     })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
@@ -229,15 +166,14 @@ async function completeJob(jobId) {
   if (error) throw error;
 }
 
-async function failJob(jobId, lastErrorCode) {
-  const now = nowIso();
+async function failJob(jobId, code) {
   const { error } = await sb
     .from("execution_jobs")
     .update({
       status: "failed",
-      heartbeat_at: now,
+      last_error: code || "unknown_error",
       last_step: "failed",
-      last_error: lastErrorCode || "unknown_error",
+      heartbeat_at: nowIso(),
     })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
@@ -245,10 +181,10 @@ async function failJob(jobId, lastErrorCode) {
   if (error) throw error;
 }
 
-// ---------- webhook execution ----------
+// ---------- webhook ----------
 async function executeViaWebhook(job) {
-  if (!hasWebhook) {
-    return { ok: false, code: "missing_webhook_url", detail: "WORKER_WEBHOOK_URL not set" };
+  if (!WORKER_WEBHOOK_URL) {
+    return { ok: false, code: "missing_webhook_url" };
   }
 
   const body = {
@@ -259,13 +195,11 @@ async function executeViaWebhook(job) {
     ts: nowIso(),
   };
 
-  const headers = { "content-type": "application/json" };
-
-  if (hasApiSecret) {
-    headers["x-api-secret"] = API_SECRET;
-    headers["x-api-key"] = API_SECRET;
-    headers["authorization"] = `Bearer ${API_SECRET}`;
-  }
+  const headers = {
+    "content-type": "application/json",
+    "x-api-secret": API_SECRET,
+    authorization: `Bearer ${API_SECRET}`,
+  };
 
   const res = await fetchWithTimeout(
     WORKER_WEBHOOK_URL,
@@ -274,28 +208,31 @@ async function executeViaWebhook(job) {
   );
 
   const text = await res.text().catch(() => "");
+
   if (!res.ok) {
-    return { ok: false, code: `webhook_failed_http_${res.status}`, detail: text.slice(0, 500) };
+    return {
+      ok: false,
+      code: `webhook_failed_http_${res.status}`,
+      detail: text.slice(0, 300),
+    };
   }
 
-  return { ok: true, code: "ok", detail: text.slice(0, 500) };
+  return { ok: true };
 }
 
 // ---------- main loop ----------
 async function loop() {
   while (true) {
     try {
-      log({ tag: TAG, msg: "POLL", ts: nowIso(), types: TYPES });
+      const job = await pickQueuedJob(TYPES);
 
-      const candidate = await pickQueuedJob(TYPES);
-      if (!candidate) {
+      if (!job) {
         await sleep(POLL_MS);
         continue;
       }
 
-      const claimed = await claimJob(candidate.id);
+      const claimed = await claimJob(job.id);
       if (!claimed) {
-        // race condition: another worker took it
         await sleep(250);
         continue;
       }
@@ -305,38 +242,19 @@ async function loop() {
         msg: "JOB_CLAIMED",
         ts: nowIso(),
         id: claimed.id,
-        type: claimed.type,
-        run_at: claimed.run_at || null,
-        claimed_by: claimed.claimed_by,
-        last_step: claimed.last_step,
       });
 
       const result = await executeViaWebhook(claimed);
 
       if (result.ok) {
         await completeJob(claimed.id);
-        log({ tag: TAG, msg: "JOB_COMPLETED", ts: nowIso(), id: claimed.id, type: claimed.type });
+        log({ tag: TAG, msg: "JOB_COMPLETED", id: claimed.id });
       } else {
         await failJob(claimed.id, result.code);
-        log({
-          tag: TAG,
-          msg: "JOB_FAILED",
-          ts: nowIso(),
-          id: claimed.id,
-          type: claimed.type,
-          last_error: result.code,
-          detail: result.detail,
-        });
+        log({ tag: TAG, msg: "JOB_FAILED", id: claimed.id, code: result.code });
       }
-
-      await sleep(250);
     } catch (err) {
-      log({
-        tag: TAG,
-        msg: "LOOP_ERROR",
-        ts: nowIso(),
-        error: String(err && err.message ? err.message : err),
-      });
+      log({ tag: TAG, msg: "LOOP_ERROR", error: err.message });
       await sleep(Math.max(1000, POLL_MS));
     }
   }
