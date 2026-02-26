@@ -1,34 +1,33 @@
 /**
- * worker.js (CommonJS) — Production-safe execution worker for Railway.
+ * worker.js (CommonJS)
+ * Production-safe execution worker for Railway (Supabase-backed job queue).
  *
- * Fixes:
- *  - Picks only runnable jobs: status='queued' AND (run_at is null OR run_at <= now()) AND unclaimed
- *  - Reads TYPES from TYPES or WORKER_TYPES (either works)
- *  - Strong queue audit to prove whether jobs exist in the DB
- *  - Clear logging of SUPABASE_URL hostname to catch “wrong project” instantly
+ * Purpose:
+ *  - Polls execution_jobs for runnable queued jobs (by type)
+ *  - Claims → POSTs to ladder-bot worker webhook → completes or fails job
+ *  - Prints HARD diagnostics (QUEUE_AUDIT + PICK_DEBUG) so we never guess again
  *
- * Env vars expected:
+ * Env vars expected (Railway):
  *  - SUPABASE_URL
  *  - SUPABASE_SERVICE_KEY
- *  - WORKER_ENABLED
- *  - WORKER_ID
- *  - TYPES (or WORKER_TYPES)
- *  - POLL_MS
- *  - HEARTBEAT_SECS
- *  - JOB_TIMEOUT_MS
- *  - WORKER_WEBHOOK_URL
- *  - API_SECRET
+ *  - WORKER_ENABLED           (1/0 or true/false)
+ *  - WORKER_ID               (e.g. ladder-worker-1)
+ *  - TYPES or WORKER_TYPES   (default: execute_intent)
+ *  - POLL_MS                 (default: 2000)
+ *  - HEARTBEAT_SECS          (default: 20)
+ *  - JOB_TIMEOUT_MS          (default: 60000)
+ *  - MAX_ATTEMPTS            (default: 3)
+ *  - RETRY_BACKOFF_MS        (default: 5000)
+ *  - WORKER_WEBHOOK_URL      (full endpoint, e.g. https://ladder-bot.../webhook/worker)
+ *  - API_SECRET              (must match ladder-bot API_SECRET)
  */
 
 const { createClient } = require("@supabase/supabase-js");
+const { URL } = require("url");
 
-// ---------- helpers ----------
+// ---------------- helpers ----------------
 function nowIso() {
   return new Date().toISOString();
-}
-
-function nowMs() {
-  return Date.now();
 }
 
 function log(obj) {
@@ -58,57 +57,71 @@ function safeTrim(v) {
 function parseTypes(raw) {
   if (!raw) return ["execute_intent"];
   const s = String(raw).trim();
-  if (!s) return ["execute_intent"];
 
-  // JSON array support
+  // JSON array form
   if (s.startsWith("[")) {
     try {
       const arr = JSON.parse(s);
-      if (Array.isArray(arr) && arr.length) return arr.map((x) => String(x).trim()).filter(Boolean);
+      if (Array.isArray(arr) && arr.length) return arr.map(String);
     } catch {}
   }
 
-  // CSV/space support
-  return s
+  // Comma/space separated form
+  const out = s
     .split(/[,\s]+/g)
     .map((x) => x.trim())
     .filter(Boolean);
-}
 
-function normalizeWebhookUrl(u) {
-  return safeTrim(u);
-}
-
-function hostnameOf(url) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return "";
-  }
+  return out.length ? out : ["execute_intent"];
 }
 
 async function fetchWithTimeout(url, opts, timeoutMs) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...opts, signal: controller.signal });
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    return res;
   } finally {
     clearTimeout(id);
   }
 }
 
-// ---------- config ----------
+function normalizeWebhookUrl(u) {
+  return safeTrim(u);
+}
+
+function hostOf(maybeUrl) {
+  try {
+    return new URL(maybeUrl).host;
+  } catch {
+    return null;
+  }
+}
+
+function prefixOfUrl(maybeUrl) {
+  try {
+    const u = new URL(maybeUrl);
+    return `${u.protocol}//${u.host}${u.pathname}`.slice(0, 48) + (u.pathname.length > 20 ? "..." : "");
+  } catch {
+    return null;
+  }
+}
+
+// ---------------- config ----------------
 const TAG = "AUX";
 
 const WORKER_ENABLED = envBool("WORKER_ENABLED", true);
 const WORKER_ID = safeTrim(process.env.WORKER_ID || "ladder-worker-1");
 
-// Support BOTH env var names (your Railway UI shows both exist)
-const TYPES = parseTypes(process.env.TYPES || process.env.WORKER_TYPES || "execute_intent");
+// Prefer WORKER_TYPES if set, else TYPES
+const TYPES = parseTypes(process.env.WORKER_TYPES || process.env.TYPES || "execute_intent");
 
 const POLL_MS = envInt("POLL_MS", 2000);
 const HEARTBEAT_SECS = envInt("HEARTBEAT_SECS", 20);
 const JOB_TIMEOUT_MS = envInt("JOB_TIMEOUT_MS", 60000);
+
+const MAX_ATTEMPTS = envInt("MAX_ATTEMPTS", 3);
+const RETRY_BACKOFF_MS = envInt("RETRY_BACKOFF_MS", 5000);
 
 const SUPABASE_URL = safeTrim(process.env.SUPABASE_URL || "");
 const SUPABASE_SERVICE_KEY = safeTrim(process.env.SUPABASE_SERVICE_KEY || "");
@@ -120,10 +133,6 @@ const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
 const hasApiSecret = Boolean(API_SECRET);
 
-const SUPABASE_HOST = hostnameOf(SUPABASE_URL);
-const WEBHOOK_HOST = hostnameOf(WORKER_WEBHOOK_URL);
-
-// ---------- start log ----------
 log({
   tag: TAG,
   msg: "WORKER_STARTED",
@@ -134,13 +143,14 @@ log({
   POLL_MS,
   HEARTBEAT_SECS,
   JOB_TIMEOUT_MS,
+  MAX_ATTEMPTS,
+  RETRY_BACKOFF_MS,
   hasSupabase,
   hasWebhook,
   hasApiSecret,
-  supabase_host: SUPABASE_HOST,
-  webhook_host: WEBHOOK_HOST,
-  // show first chars only (safe)
-  webhook_url_prefix: WORKER_WEBHOOK_URL ? WORKER_WEBHOOK_URL.slice(0, 60) : "",
+  supabase_host: hostOf(SUPABASE_URL),
+  webhook_host: hostOf(WORKER_WEBHOOK_URL),
+  webhook_url_prefix: prefixOfUrl(WORKER_WEBHOOK_URL),
 });
 
 // If disabled, exit cleanly
@@ -163,78 +173,125 @@ if (!hasSupabase) {
 if (!hasWebhook) {
   log({
     tag: TAG,
-    msg: "FATAL_MISSING_WEBHOOK_URL",
+    msg: "WARN_MISSING_WEBHOOK_URL",
     ts: nowIso(),
-    hint: "Set WORKER_WEBHOOK_URL (or WEBHOOK_URL) to ladder-bot /webhook/worker",
+    hint: "Set WORKER_WEBHOOK_URL to ladder-bot worker endpoint (full path, e.g. /webhook/worker)",
   });
-  process.exit(1);
 }
 
-if (!hasApiSecret) {
+if (hasWebhook && !hasApiSecret) {
   log({
     tag: TAG,
-    msg: "FATAL_MISSING_API_SECRET",
+    msg: "WARN_MISSING_API_SECRET",
     ts: nowIso(),
-    hint: "Set API_SECRET (must match ladder-bot API_SECRET) or you will get 401",
+    hint: "Set API_SECRET (must match ladder-bot API_SECRET) to avoid webhook_failed_http_401",
   });
-  process.exit(1);
 }
 
-// ---------- supabase client ----------
+// ---------------- supabase client ----------------
 const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
 });
 
-// ---------- queue audit (proves whether jobs exist) ----------
+// ---------------- diagnostics (NO GUESSING) ----------------
+let lastAuditAt = 0;
+const AUDIT_EVERY_MS = 10_000;
+
 async function queueAudit(types) {
-  // 1) total queued (all types)
-  const q1 = sb
+  // Count jobs by status (fast + reliable with head:true)
+  const statuses = ["queued", "running", "completed", "failed", "archived", "cancelled"];
+  const statusCounts = {};
+  for (const st of statuses) {
+    const { count, error } = await sb
+      .from("execution_jobs")
+      .select("id", { count: "exact", head: true })
+      .eq("status", st);
+    if (error) throw error;
+    statusCounts[st] = count ?? null;
+  }
+
+  // Count queued jobs for our TYPES
+  const { count: queuedForTypes, error: eQueuedTypes } = await sb
     .from("execution_jobs")
     .select("id", { count: "exact", head: true })
-    .eq("status", "queued");
-
-  // 2) queued + unclaimed + runnable by time (for our types)
-  // We don’t trust run_at not-null; treat null as runnable.
-  // Supabase filter for "run_at <= now()" via raw SQL isn’t available here,
-  // so we fetch a small sample ordered by run_at and decide in JS.
-  const q2 = sb
-    .from("execution_jobs")
-    .select("id,run_at,claimed_by,type,status,created_at")
     .eq("status", "queued")
     .is("claimed_by", null)
-    .in("type", types)
-    .order("run_at", { ascending: true, nullsFirst: true })
+    .in("type", types);
+  if (eQueuedTypes) throw eQueuedTypes;
+
+  // Recent jobs (last 10)
+  const { data: recentJobs, error: eRecent } = await sb
+    .from("execution_jobs")
+    .select("id,type,status,claimed_by,run_at,created_at,last_error,last_step,attempts")
+    .order("created_at", { ascending: false })
     .limit(10);
+  if (eRecent) throw eRecent;
 
-  const [{ count: totalQueued, error: e1 }, { data: sample, error: e2 }] = await Promise.all([q1, q2]);
-  if (e1) throw e1;
-  if (e2) throw e2;
+  // Intents visibility (helps prove upstream enqueue)
+  let pendingIntents = null;
+  let approvedIntents = null;
+  try {
+    const a = await sb.from("execution_intents").select("id", { count: "exact", head: true }).eq("status", "pending");
+    if (!a.error) pendingIntents = a.count ?? null;
 
-  const now = new Date();
-  const runnable = (sample || []).filter((j) => {
-    if (!j.run_at) return true;
-    const t = new Date(j.run_at);
-    return Number.isFinite(t.getTime()) && t.getTime() <= now.getTime();
-  });
+    const b = await sb.from("execution_intents").select("id", { count: "exact", head: true }).eq("status", "approved");
+    if (!b.error) approvedIntents = b.count ?? null;
+  } catch {}
+
+  // Oldest runnable run_at (queued/unclaimed for our types)
+  let oldestRunAt = null;
+  try {
+    const { data } = await sb
+      .from("execution_jobs")
+      .select("run_at")
+      .eq("status", "queued")
+      .is("claimed_by", null)
+      .in("type", types)
+      .order("run_at", { ascending: true, nullsFirst: true })
+      .limit(1);
+    if (data && data[0]) oldestRunAt = data[0].run_at ?? null;
+  } catch {}
 
   log({
     tag: TAG,
     msg: "QUEUE_AUDIT",
     ts: nowIso(),
-    totalQueued: totalQueued ?? null,
-    unclaimedQueuedSample: (sample || []).length,
-    runnableSampleIds: runnable.map((x) => x.id),
-    oldest_run_at: sample && sample[0] ? sample[0].run_at : null,
     types,
+    statusCounts,
+    queuedForTypes: queuedForTypes ?? null,
+    pendingIntents,
+    approvedIntents,
+    oldest_run_at: oldestRunAt,
+    recentJobs: (recentJobs || []).map((j) => ({
+      id: j.id,
+      type: j.type,
+      status: j.status,
+      claimed_by: j.claimed_by,
+      run_at: j.run_at,
+      created_at: j.created_at,
+      attempts: j.attempts,
+      last_step: j.last_step,
+      last_error: j.last_error ? String(j.last_error).slice(0, 120) : null,
+    })),
   });
 }
 
-// ---------- core DB ops ----------
+// ---------------- core DB ops ----------------
+function isRunnable(job) {
+  // runnable if run_at is null OR run_at <= now
+  if (!job) return false;
+  if (!job.run_at) return true;
+  const t = Date.parse(job.run_at);
+  if (!Number.isFinite(t)) return true;
+  return t <= Date.now();
+}
+
 async function pickQueuedJob(types) {
-  // Pull a small batch then choose the first runnable in JS
+  // Fetch a small window, then pick first runnable locally.
+  // This avoids SQL operator issues on run_at and keeps it compatible across schemas.
   const { data, error } = await sb
     .from("execution_jobs")
-    .select("id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step,run_at,last_error")
+    .select("id,type,status,payload,attempts,created_at,run_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
     .in("type", types)
     .eq("status", "queued")
     .is("claimed_by", null)
@@ -244,34 +301,17 @@ async function pickQueuedJob(types) {
 
   if (error) throw error;
 
-  const now = Date.now();
-  const runnable = (data || []).find((j) => {
-    if (!j.run_at) return true;
-    const t = new Date(j.run_at).getTime();
-    return Number.isFinite(t) && t <= now;
-  });
+  const list = Array.isArray(data) ? data : [];
+  const runnable = list.find(isRunnable) || null;
 
-  if (!runnable) {
-    log({
-      tag: TAG,
-      msg: "PICK_DEBUG",
-      ts: nowIso(),
-      queued_seen: (data || []).length,
-      oldest_run_at: data && data[0] ? data[0].run_at : null,
-      runnable_found: false,
-    });
-    return null;
-  }
-
+  // PICK_DEBUG exactly like your logs
   log({
     tag: TAG,
     msg: "PICK_DEBUG",
     ts: nowIso(),
-    queued_seen: (data || []).length,
-    oldest_run_at: data && data[0] ? data[0].run_at : null,
-    runnable_found: true,
-    picked_id: runnable.id,
-    picked_run_at: runnable.run_at || null,
+    queued_seen: list.length,
+    oldest_run_at: list.length ? (list[0].run_at ?? null) : null,
+    runnable_found: Boolean(runnable),
   });
 
   return runnable;
@@ -292,11 +332,25 @@ async function claimJob(jobId) {
     .eq("id", jobId)
     .eq("status", "queued")
     .is("claimed_by", null)
-    .select("id,type,status,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at")
+    .select("id,type,status,payload,attempts,created_at,run_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
     .limit(1);
 
   if (error) throw error;
   return data && data[0] ? data[0] : null;
+}
+
+async function touchHeartbeat(jobId) {
+  const now = nowIso();
+  const { error } = await sb
+    .from("execution_jobs")
+    .update({
+      heartbeat_at: now,
+      last_step: "heartbeat",
+    })
+    .eq("id", jobId)
+    .eq("claimed_by", WORKER_ID)
+    .in("status", ["running"]);
+  if (error) throw error;
 }
 
 async function completeJob(jobId) {
@@ -314,27 +368,48 @@ async function completeJob(jobId) {
   if (error) throw error;
 }
 
-async function failJob(jobId, lastErrorCode, detail) {
+async function failJob(jobId, lastErrorCode) {
   const now = nowIso();
-  const code = safeTrim(lastErrorCode) || "unknown_error";
-  const msg = safeTrim(detail).slice(0, 500);
 
-  const { error } = await sb
+  // Get current attempts so we can decide retry/failed
+  const { data: cur, error: eCur } = await sb
     .from("execution_jobs")
-    .update({
-      status: "failed",
-      heartbeat_at: now,
-      last_step: "failed",
-      last_error: code + (msg ? `: ${msg}` : ""),
-    })
+    .select("id,attempts")
     .eq("id", jobId)
-    .eq("claimed_by", WORKER_ID);
+    .limit(1);
+  if (eCur) throw eCur;
+
+  const attempts = (cur && cur[0] && Number.isFinite(cur[0].attempts)) ? cur[0].attempts : 0;
+  const nextAttempts = attempts + 1;
+
+  const shouldRetry = nextAttempts < MAX_ATTEMPTS;
+
+  const patch = {
+    attempts: nextAttempts,
+    heartbeat_at: now,
+    last_step: shouldRetry ? "retry_scheduled" : "failed",
+    last_error: lastErrorCode || "unknown_error",
+    status: shouldRetry ? "queued" : "failed",
+    claimed_by: shouldRetry ? null : WORKER_ID,
+    claimed_at: shouldRetry ? null : now,
+  };
+
+  if (shouldRetry) {
+    // backoff
+    patch.run_at = new Date(Date.now() + RETRY_BACKOFF_MS).toISOString();
+  }
+
+  const { error } = await sb.from("execution_jobs").update(patch).eq("id", jobId);
 
   if (error) throw error;
 }
 
-// ---------- webhook execution ----------
+// ---------------- webhook execution ----------------
 async function executeViaWebhook(job) {
+  if (!hasWebhook) {
+    return { ok: false, code: "missing_webhook_url", detail: "WORKER_WEBHOOK_URL not set" };
+  }
+
   const body = {
     job_id: job.id,
     type: job.type,
@@ -345,36 +420,61 @@ async function executeViaWebhook(job) {
 
   const headers = {
     "content-type": "application/json",
-    "x-api-secret": API_SECRET,
-    "x-api-key": API_SECRET,
-    authorization: `Bearer ${API_SECRET}`,
   };
 
-  const res = await fetchWithTimeout(
-    WORKER_WEBHOOK_URL,
-    { method: "POST", headers, body: JSON.stringify(body) },
-    JOB_TIMEOUT_MS
-  );
-
-  const text = await res.text().catch(() => "");
-  if (!res.ok) {
-    return { ok: false, code: `webhook_failed_http_${res.status}`, detail: text };
+  if (hasApiSecret) {
+    headers["x-api-secret"] = API_SECRET;
+    headers["x-api-key"] = API_SECRET;
+    headers["authorization"] = `Bearer ${API_SECRET}`;
   }
 
-  return { ok: true, code: "ok", detail: text };
+  // Heartbeat timer
+  let hb = null;
+  try {
+    hb = setInterval(() => {
+      touchHeartbeat(job.id).catch(() => {});
+    }, Math.max(5000, HEARTBEAT_SECS * 1000));
+  } catch {}
+
+  try {
+    const res = await fetchWithTimeout(
+      WORKER_WEBHOOK_URL,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      },
+      JOB_TIMEOUT_MS
+    );
+
+    const text = await res.text().catch(() => "");
+    if (!res.ok) {
+      return {
+        ok: false,
+        code: `webhook_failed_http_${res.status}`,
+        detail: text.slice(0, 500),
+      };
+    }
+
+    return { ok: true, code: "ok", detail: text.slice(0, 500) };
+  } catch (err) {
+    const msg = String(err && err.message ? err.message : err);
+    return { ok: false, code: "webhook_failed_exception", detail: msg.slice(0, 500) };
+  } finally {
+    if (hb) clearInterval(hb);
+  }
 }
 
-// ---------- main loop ----------
-let lastAuditAt = 0;
-
+// ---------------- main loop ----------------
 async function loop() {
   while (true) {
     try {
       log({ tag: TAG, msg: "POLL", ts: nowIso(), types: TYPES });
 
-      // audit every ~10 seconds to prove what’s in the DB
-      if (nowMs() - lastAuditAt > 10000) {
-        lastAuditAt = nowMs();
+      // periodic deep audit
+      const now = Date.now();
+      if (now - lastAuditAt > AUDIT_EVERY_MS) {
+        lastAuditAt = now;
         await queueAudit(TYPES);
       }
 
@@ -397,7 +497,7 @@ async function loop() {
         id: claimed.id,
         type: claimed.type,
         claimed_by: claimed.claimed_by,
-        run_at: claimed.run_at || null,
+        last_step: claimed.last_step,
       });
 
       const result = await executeViaWebhook(claimed);
@@ -406,7 +506,7 @@ async function loop() {
         await completeJob(claimed.id);
         log({ tag: TAG, msg: "JOB_COMPLETED", ts: nowIso(), id: claimed.id, type: claimed.type });
       } else {
-        await failJob(claimed.id, result.code, result.detail);
+        await failJob(claimed.id, result.code);
         log({
           tag: TAG,
           msg: "JOB_FAILED",
@@ -414,7 +514,7 @@ async function loop() {
           id: claimed.id,
           type: claimed.type,
           last_error: result.code,
-          detail: safeTrim(result.detail).slice(0, 300),
+          detail: result.detail,
         });
       }
 
