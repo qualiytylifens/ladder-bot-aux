@@ -77,6 +77,15 @@ function normalizeWebhookUrl(u) {
   return safeTrim(u);
 }
 
+function lower(v) {
+  return String(v || "").toLowerCase();
+}
+
+function isExitAction(a) {
+  const x = lower(a);
+  return x === "close" || x === "sell" || x === "exit";
+}
+
 // ---------- config ----------
 const TAG = "AUX";
 const WORKER_ENABLED = envBool("WORKER_ENABLED", true);
@@ -220,22 +229,91 @@ async function failJob(jobId, lastErrorCode) {
   if (error) throw error;
 }
 
+// ---------- intent/trade helpers ----------
+async function fetchIntent(intentId) {
+  const { data, error } = await sb
+    .from("execution_intents")
+    .select("id,action,symbol,status,reason,execution_mode,raw_signal,created_at")
+    .eq("id", intentId)
+    .limit(1);
+
+  if (error) throw error;
+  return data && data[0] ? data[0] : null;
+}
+
+function extractTradeId(intent) {
+  const rs = intent && intent.raw_signal ? intent.raw_signal : null;
+  if (!rs || typeof rs !== "object") return null;
+  // tolerate naming differences
+  return (
+    rs.trade_id ||
+    rs.tradeId ||
+    rs.tradeID ||
+    rs.position_id ||
+    rs.positionId ||
+    null
+  );
+}
+
+async function isTradeStillOpen(tradeId) {
+  if (!tradeId) return null; // unknown
+  const { data, error } = await sb
+    .from("trades_prod")
+    .select("id,status,closed_at")
+    .eq("id", tradeId)
+    .limit(1);
+
+  if (error) throw error;
+  if (!data || !data[0]) return null;
+  const row = data[0];
+  return String(row.status || "").toLowerCase() === "open";
+}
+
 // ---------- webhook execution ----------
 async function executeViaWebhook(job) {
   if (!hasWebhook) {
     return { ok: false, code: "missing_webhook_url", detail: "WORKER_WEBHOOK_URL not set" };
   }
 
+  const p = job.payload || {};
+  const intentId = p.intent_id || p.intentId || p.intent || null;
+  const action = p.action || null;
+  const symbol = p.symbol || null;
+
+  // Pull authoritative intent details (so we can provide trade_id + normalized fields)
+  let intent = null;
+  if (intentId) {
+    intent = await fetchIntent(intentId);
+  }
+
+  const effectiveAction = (intent && intent.action) ? intent.action : action;
+  const effectiveSymbol = (intent && intent.symbol) ? intent.symbol : symbol;
+  const executionMode = (intent && intent.execution_mode) ? intent.execution_mode : (p.execution_mode || p.mode || "paper");
+  const tradeId = extractTradeId(intent) || p.trade_id || p.tradeId || null;
+
+  // 🔥 Critical: flatten fields for ladder-bot compatibility
+  // Keep payload nested too, for backward compatibility / debugging.
   const body = {
+    // expected by most ladder-bot implementations
+    action: effectiveAction,
+    symbol: effectiveSymbol,
+    intent_id: intentId,
+
+    // required for reliable paper closes
+    trade_id: tradeId,
+    execution_mode: executionMode,
+
+    // tracing
     job_id: job.id,
     type: job.type,
-    payload: job.payload || {},
     worker_id: WORKER_ID,
     ts: nowIso(),
+
+    // keep original payload for compatibility
+    payload: job.payload || {},
+    intent_snapshot: intent ? { id: intent.id, status: intent.status, reason: intent.reason, created_at: intent.created_at } : null,
   };
 
-  // Send auth in multiple header styles for compatibility with ladder-bot implementations.
-  // Ladder-bot should validate API_SECRET on one of these.
   const headers = {
     "content-type": "application/json",
   };
@@ -262,7 +340,24 @@ async function executeViaWebhook(job) {
       ok: false,
       code: `webhook_failed_http_${res.status}`,
       detail: text.slice(0, 500),
+      meta: { action: effectiveAction, symbol: effectiveSymbol, intent_id: intentId, trade_id: tradeId },
     };
+  }
+
+  // Post-check: for exits, ensure trade actually closes (prevents silent no-op completes)
+  if (isExitAction(effectiveAction) && tradeId) {
+    // small delay to allow ladder-bot to write trade update/execution rows
+    await sleep(400);
+
+    const stillOpen = await isTradeStillOpen(tradeId);
+    if (stillOpen === true) {
+      return {
+        ok: false,
+        code: "postcheck_trade_still_open",
+        detail: `Exit webhook returned 200 but trade still open: ${tradeId}`,
+        meta: { action: effectiveAction, symbol: effectiveSymbol, intent_id: intentId, trade_id: tradeId },
+      };
+    }
   }
 
   return { ok: true, code: "ok", detail: text.slice(0, 500) };
@@ -311,6 +406,7 @@ async function loop() {
           type: claimed.type,
           last_error: result.code,
           detail: result.detail,
+          meta: result.meta || null,
         });
       }
 
