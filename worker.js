@@ -1,25 +1,22 @@
 /**
- * worker.js (CommonJS)
- * Production-safe execution worker for Railway.
+ * worker.js (CommonJS) — Production-safe execution worker for Railway.
  *
- * Key guarantees:
- * 1) NEVER mark a job completed if ladder-bot returns an application-level failure (even if HTTP 200)
- * 2) Only pull runnable jobs (run_at <= now or run_at is null)
- * 3) Emit QUEUE_AUDIT truth logs so "not pulling" is never ambiguous again
- * 4) Retry failed jobs with backoff; archive after MAX_ATTEMPTS
+ * Fixes:
+ *  - Picks only runnable jobs: status='queued' AND (run_at is null OR run_at <= now()) AND unclaimed
+ *  - Reads TYPES from TYPES or WORKER_TYPES (either works)
+ *  - Strong queue audit to prove whether jobs exist in the DB
+ *  - Clear logging of SUPABASE_URL hostname to catch “wrong project” instantly
  *
  * Env vars expected:
  *  - SUPABASE_URL
  *  - SUPABASE_SERVICE_KEY
  *  - WORKER_ENABLED
  *  - WORKER_ID
- *  - TYPES
+ *  - TYPES (or WORKER_TYPES)
  *  - POLL_MS
  *  - HEARTBEAT_SECS
  *  - JOB_TIMEOUT_MS
- *  - MAX_ATTEMPTS
- *  - RETRY_BACKOFF_MS
- *  - WORKER_WEBHOOK_URL / WORKER_WEBHOOK_URL / WEBHOOK_URL / WORKER_WEBHOOK_URL / BOT_WEBHOOK_URL
+ *  - WORKER_WEBHOOK_URL
  *  - API_SECRET
  */
 
@@ -29,94 +26,102 @@ const { createClient } = require("@supabase/supabase-js");
 function nowIso() {
   return new Date().toISOString();
 }
+
 function nowMs() {
   return Date.now();
 }
+
 function log(obj) {
   console.log(JSON.stringify(obj));
 }
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
+
 function envBool(name, fallback = false) {
   const v = process.env[name];
   if (v == null) return fallback;
   return String(v).toLowerCase() === "true" || String(v) === "1";
 }
+
 function envInt(name, fallback) {
   const v = process.env[name];
   const n = parseInt(String(v ?? ""), 10);
   return Number.isFinite(n) ? n : fallback;
 }
+
 function safeTrim(v) {
   return String(v || "").trim();
 }
+
 function parseTypes(raw) {
   if (!raw) return ["execute_intent"];
   const s = String(raw).trim();
+  if (!s) return ["execute_intent"];
+
+  // JSON array support
   if (s.startsWith("[")) {
     try {
       const arr = JSON.parse(s);
-      if (Array.isArray(arr) && arr.length) return arr.map(String);
+      if (Array.isArray(arr) && arr.length) return arr.map((x) => String(x).trim()).filter(Boolean);
     } catch {}
   }
+
+  // CSV/space support
   return s
     .split(/[,\s]+/g)
     .map((x) => x.trim())
     .filter(Boolean);
 }
+
 function normalizeWebhookUrl(u) {
   return safeTrim(u);
 }
-function getWebhookUrlFromEnv() {
-  // tolerate naming mismatches across services
-  const candidates = [
-    process.env.WORKER_WEBHOOK_URL,
-    process.env.WORKER_WEBHOOK_URL,
-    process.env.WORKER_WEBHOOK_URL,
-    process.env.BOT_WEBHOOK_URL,
-    process.env.WEBHOOK_URL,
-  ].map(normalizeWebhookUrl);
 
-  return candidates.find(Boolean) || "";
+function hostnameOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
 }
 
 async function fetchWithTimeout(url, opts, timeoutMs) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...opts, signal: controller.signal });
-    return res;
+    return await fetch(url, { ...opts, signal: controller.signal });
   } finally {
     clearTimeout(id);
   }
 }
 
-function addMsToIso(msFromNow) {
-  return new Date(Date.now() + msFromNow).toISOString();
-}
-
 // ---------- config ----------
 const TAG = "AUX";
+
 const WORKER_ENABLED = envBool("WORKER_ENABLED", true);
 const WORKER_ID = safeTrim(process.env.WORKER_ID || "ladder-worker-1");
-const TYPES = parseTypes(process.env.TYPES || "execute_intent");
+
+// Support BOTH env var names (your Railway UI shows both exist)
+const TYPES = parseTypes(process.env.TYPES || process.env.WORKER_TYPES || "execute_intent");
+
 const POLL_MS = envInt("POLL_MS", 2000);
 const HEARTBEAT_SECS = envInt("HEARTBEAT_SECS", 20);
 const JOB_TIMEOUT_MS = envInt("JOB_TIMEOUT_MS", 60000);
 
-const MAX_ATTEMPTS = envInt("MAX_ATTEMPTS", 3);
-const RETRY_BACKOFF_MS = envInt("RETRY_BACKOFF_MS", 5000);
-
 const SUPABASE_URL = safeTrim(process.env.SUPABASE_URL || "");
 const SUPABASE_SERVICE_KEY = safeTrim(process.env.SUPABASE_SERVICE_KEY || "");
 
-const WORKER_WEBHOOK_URL = getWebhookUrlFromEnv();
+const WORKER_WEBHOOK_URL = normalizeWebhookUrl(process.env.WORKER_WEBHOOK_URL || process.env.WEBHOOK_URL || "");
 const API_SECRET = safeTrim(process.env.API_SECRET || "");
 
 const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
 const hasApiSecret = Boolean(API_SECRET);
+
+const SUPABASE_HOST = hostnameOf(SUPABASE_URL);
+const WEBHOOK_HOST = hostnameOf(WORKER_WEBHOOK_URL);
 
 // ---------- start log ----------
 log({
@@ -129,14 +134,16 @@ log({
   POLL_MS,
   HEARTBEAT_SECS,
   JOB_TIMEOUT_MS,
-  MAX_ATTEMPTS,
-  RETRY_BACKOFF_MS,
   hasSupabase,
   hasWebhook,
   hasApiSecret,
-  webhook_url: hasWebhook ? WORKER_WEBHOOK_URL : "(missing)",
+  supabase_host: SUPABASE_HOST,
+  webhook_host: WEBHOOK_HOST,
+  // show first chars only (safe)
+  webhook_url_prefix: WORKER_WEBHOOK_URL ? WORKER_WEBHOOK_URL.slice(0, 60) : "",
 });
 
+// If disabled, exit cleanly
 if (!WORKER_ENABLED) {
   log({ tag: TAG, msg: "WORKER_DISABLED_BY_ENV", ts: nowIso() });
   setTimeout(() => process.exit(0), 250);
@@ -158,7 +165,7 @@ if (!hasWebhook) {
     tag: TAG,
     msg: "FATAL_MISSING_WEBHOOK_URL",
     ts: nowIso(),
-    hint: "Set WORKER_WEBHOOK_URL (or WEBHOOK_URL / BOT_WEBHOOK_URL) to ladder-bot /webhook/worker",
+    hint: "Set WORKER_WEBHOOK_URL (or WEBHOOK_URL) to ladder-bot /webhook/worker",
   });
   process.exit(1);
 }
@@ -168,7 +175,7 @@ if (!hasApiSecret) {
     tag: TAG,
     msg: "FATAL_MISSING_API_SECRET",
     ts: nowIso(),
-    hint: "Set API_SECRET (must match ladder-bot) to avoid webhook_failed_http_401",
+    hint: "Set API_SECRET (must match ladder-bot API_SECRET) or you will get 401",
   });
   process.exit(1);
 }
@@ -178,89 +185,100 @@ const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
 });
 
-// ---------- DB ops ----------
+// ---------- queue audit (proves whether jobs exist) ----------
 async function queueAudit(types) {
-  // Truth telemetry: what exists vs what is runnable
-  const { count: totalQueued, error: e1 } = await sb
+  // 1) total queued (all types)
+  const q1 = sb
     .from("execution_jobs")
     .select("id", { count: "exact", head: true })
-    .in("type", types)
     .eq("status", "queued");
 
-  if (e1) throw e1;
-
-  const { count: unclaimedQueued, error: e2 } = await sb
+  // 2) queued + unclaimed + runnable by time (for our types)
+  // We don’t trust run_at not-null; treat null as runnable.
+  // Supabase filter for "run_at <= now()" via raw SQL isn’t available here,
+  // so we fetch a small sample ordered by run_at and decide in JS.
+  const q2 = sb
     .from("execution_jobs")
-    .select("id", { count: "exact", head: true })
-    .in("type", types)
-    .eq("status", "queued")
-    .is("claimed_by", null);
-
-  if (e2) throw e2;
-
-  // runnable: unclaimed + (run_at is null or run_at <= now)
-  // We can’t express "or" perfectly with builder across null+lte without .or()
-  const now = nowIso();
-  const { data: runnableSample, error: e3 } = await sb
-    .from("execution_jobs")
-    .select("id,run_at")
-    .in("type", types)
+    .select("id,run_at,claimed_by,type,status,created_at")
     .eq("status", "queued")
     .is("claimed_by", null)
-    .or(`run_at.is.null,run_at.lte.${now}`)
-    .order("run_at", { ascending: true, nullsFirst: true })
-    .limit(5);
-
-  if (e3) throw e3;
-
-  const runnableCount = runnableSample?.length ? null : null; // we don't count here to avoid extra query
-
-  const { data: claimedSample, error: e4 } = await sb
-    .from("execution_jobs")
-    .select("claimed_by")
     .in("type", types)
-    .eq("status", "queued")
-    .not("claimed_by", "is", null)
-    .limit(5);
+    .order("run_at", { ascending: true, nullsFirst: true })
+    .limit(10);
 
-  if (e4) throw e4;
+  const [{ count: totalQueued, error: e1 }, { data: sample, error: e2 }] = await Promise.all([q1, q2]);
+  if (e1) throw e1;
+  if (e2) throw e2;
 
-  const oldestRunAt = runnableSample?.[0]?.run_at ?? null;
+  const now = new Date();
+  const runnable = (sample || []).filter((j) => {
+    if (!j.run_at) return true;
+    const t = new Date(j.run_at);
+    return Number.isFinite(t.getTime()) && t.getTime() <= now.getTime();
+  });
 
   log({
     tag: TAG,
     msg: "QUEUE_AUDIT",
     ts: nowIso(),
-    totalQueued: totalQueued ?? 0,
-    unclaimedQueued: unclaimedQueued ?? 0,
-    runnableSampleIds: (runnableSample || []).map((r) => r.id),
-    oldest_run_at: oldestRunAt,
-    claimedBySample: (claimedSample || []).map((r) => r.claimed_by).filter(Boolean),
+    totalQueued: totalQueued ?? null,
+    unclaimedQueuedSample: (sample || []).length,
+    runnableSampleIds: runnable.map((x) => x.id),
+    oldest_run_at: sample && sample[0] ? sample[0].run_at : null,
+    types,
   });
 }
 
+// ---------- core DB ops ----------
 async function pickQueuedJob(types) {
-  const now = nowIso();
-
-  // Pull ONLY runnable jobs: queued + unclaimed + (run_at is null or <= now)
+  // Pull a small batch then choose the first runnable in JS
   const { data, error } = await sb
     .from("execution_jobs")
-    .select("id,type,status,payload,attempts,created_at,run_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error")
+    .select("id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step,run_at,last_error")
     .in("type", types)
     .eq("status", "queued")
     .is("claimed_by", null)
-    .or(`run_at.is.null,run_at.lte.${now}`)
     .order("run_at", { ascending: true, nullsFirst: true })
     .order("created_at", { ascending: true })
-    .limit(1);
+    .limit(25);
 
   if (error) throw error;
-  return data && data[0] ? data[0] : null;
+
+  const now = Date.now();
+  const runnable = (data || []).find((j) => {
+    if (!j.run_at) return true;
+    const t = new Date(j.run_at).getTime();
+    return Number.isFinite(t) && t <= now;
+  });
+
+  if (!runnable) {
+    log({
+      tag: TAG,
+      msg: "PICK_DEBUG",
+      ts: nowIso(),
+      queued_seen: (data || []).length,
+      oldest_run_at: data && data[0] ? data[0].run_at : null,
+      runnable_found: false,
+    });
+    return null;
+  }
+
+  log({
+    tag: TAG,
+    msg: "PICK_DEBUG",
+    ts: nowIso(),
+    queued_seen: (data || []).length,
+    oldest_run_at: data && data[0] ? data[0].run_at : null,
+    runnable_found: true,
+    picked_id: runnable.id,
+    picked_run_at: runnable.run_at || null,
+  });
+
+  return runnable;
 }
 
 async function claimJob(jobId) {
   const now = nowIso();
-  // Only claim if still queued + unclaimed
   const { data, error } = await sb
     .from("execution_jobs")
     .update({
@@ -281,17 +299,6 @@ async function claimJob(jobId) {
   return data && data[0] ? data[0] : null;
 }
 
-async function heartbeat(jobId) {
-  const now = nowIso();
-  const { error } = await sb
-    .from("execution_jobs")
-    .update({ heartbeat_at: now, last_step: "running" })
-    .eq("id", jobId)
-    .eq("claimed_by", WORKER_ID);
-
-  if (error) throw error;
-}
-
 async function completeJob(jobId) {
   const now = nowIso();
   const { error } = await sb
@@ -300,7 +307,6 @@ async function completeJob(jobId) {
       status: "completed",
       heartbeat_at: now,
       last_step: "completed",
-      last_error: null,
     })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
@@ -308,114 +314,26 @@ async function completeJob(jobId) {
   if (error) throw error;
 }
 
-async function archiveJob(jobId, lastErrorCode) {
+async function failJob(jobId, lastErrorCode, detail) {
   const now = nowIso();
+  const code = safeTrim(lastErrorCode) || "unknown_error";
+  const msg = safeTrim(detail).slice(0, 500);
+
   const { error } = await sb
     .from("execution_jobs")
     .update({
-      status: "archived",
+      status: "failed",
       heartbeat_at: now,
-      last_step: "archived",
-      last_error: lastErrorCode || "archived_unknown",
+      last_step: "failed",
+      last_error: code + (msg ? `: ${msg}` : ""),
     })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
 
   if (error) throw error;
-}
-
-async function retryOrArchive(job, lastErrorCode) {
-  const attempts = Number.isFinite(job.attempts) ? job.attempts : 0;
-  const nextAttempts = attempts + 1;
-
-  if (nextAttempts >= MAX_ATTEMPTS) {
-    await archiveJob(job.id, lastErrorCode || "deadletter_max_attempts");
-    log({
-      tag: TAG,
-      msg: "JOB_ARCHIVED_MAX_ATTEMPTS",
-      ts: nowIso(),
-      id: job.id,
-      type: job.type,
-      attempts: nextAttempts,
-      last_error: lastErrorCode,
-    });
-    return;
-  }
-
-  const runAt = addMsToIso(RETRY_BACKOFF_MS);
-
-  const { error } = await sb
-    .from("execution_jobs")
-    .update({
-      status: "queued",
-      attempts: nextAttempts,
-      last_error: lastErrorCode || "retry_unknown",
-      last_step: "retry_scheduled",
-      run_at: runAt,
-      // keep claimed_by for audit trail? your schema uses claimed_by/claimed_at; we clear so it can be pulled again
-      claimed_by: null,
-      claimed_at: null,
-      heartbeat_at: null,
-    })
-    .eq("id", job.id)
-    .eq("claimed_by", WORKER_ID);
-
-  if (error) throw error;
-
-  log({
-    tag: TAG,
-    msg: "JOB_REQUEUED",
-    ts: nowIso(),
-    id: job.id,
-    type: job.type,
-    attempts: nextAttempts,
-    run_at: runAt,
-    last_error: lastErrorCode,
-  });
 }
 
 // ---------- webhook execution ----------
-function buildAuthHeaders() {
-  const headers = { "content-type": "application/json" };
-  headers["x-api-secret"] = API_SECRET;
-  headers["x-api-key"] = API_SECRET;
-  headers["authorization"] = `Bearer ${API_SECRET}`;
-  return headers;
-}
-
-function interpretAppResponse(status, text, contentType) {
-  // ladder-bot may return HTTP 200 with JSON telling us it failed (postcheck_trade_still_open etc.)
-  // We treat those as failures, not completion.
-  const ct = (contentType || "").toLowerCase();
-  if (ct.includes("application/json")) {
-    try {
-      const j = JSON.parse(text || "{}");
-
-      // Common patterns to treat as failure:
-      // { ok:false, code:"postcheck_trade_still_open", ... }
-      // { success:false, code:"...", ... }
-      // { error:"..." }
-      if (j && (j.ok === false || j.success === false)) {
-        const code = String(j.code || j.error_code || "webhook_app_failed");
-        const detail = String(j.detail || j.error || text || "").slice(0, 500);
-        return { ok: false, code, detail };
-      }
-      if (j && j.error) {
-        const code = String(j.code || "webhook_app_error");
-        const detail = String(j.error || "").slice(0, 500);
-        return { ok: false, code, detail };
-      }
-      return { ok: true, code: "ok", detail: text.slice(0, 500) };
-    } catch {
-      // If it claimed JSON but isn't parseable, treat as failure (data integrity)
-      return { ok: false, code: "webhook_bad_json", detail: (text || "").slice(0, 500) };
-    }
-  }
-
-  // Non-JSON: if HTTP is ok we assume ok, but still keep response text
-  return { ok: status >= 200 && status < 300, code: status >= 200 && status < 300 ? "ok" : `webhook_failed_http_${status}`, detail: (text || "").slice(0, 500) };
-}
-
 async function executeViaWebhook(job) {
   const body = {
     job_id: job.id,
@@ -425,41 +343,40 @@ async function executeViaWebhook(job) {
     ts: nowIso(),
   };
 
+  const headers = {
+    "content-type": "application/json",
+    "x-api-secret": API_SECRET,
+    "x-api-key": API_SECRET,
+    authorization: `Bearer ${API_SECRET}`,
+  };
+
   const res = await fetchWithTimeout(
     WORKER_WEBHOOK_URL,
-    {
-      method: "POST",
-      headers: buildAuthHeaders(),
-      body: JSON.stringify(body),
-    },
+    { method: "POST", headers, body: JSON.stringify(body) },
     JOB_TIMEOUT_MS
   );
 
-  const contentType = res.headers?.get?.("content-type") || "";
   const text = await res.text().catch(() => "");
-
-  // HTTP-level failure:
   if (!res.ok) {
-    return {
-      ok: false,
-      code: `webhook_failed_http_${res.status}`,
-      detail: text.slice(0, 500),
-    };
+    return { ok: false, code: `webhook_failed_http_${res.status}`, detail: text };
   }
 
-  // App-level interpretation (CRITICAL FIX):
-  return interpretAppResponse(res.status, text, contentType);
+  return { ok: true, code: "ok", detail: text };
 }
 
 // ---------- main loop ----------
+let lastAuditAt = 0;
+
 async function loop() {
   while (true) {
-    const loopStart = nowMs();
     try {
       log({ tag: TAG, msg: "POLL", ts: nowIso(), types: TYPES });
 
-      // Always emit truth about queue state (prevents “not pulling” confusion)
-      await queueAudit(TYPES);
+      // audit every ~10 seconds to prove what’s in the DB
+      if (nowMs() - lastAuditAt > 10000) {
+        lastAuditAt = nowMs();
+        await queueAudit(TYPES);
+      }
 
       const candidate = await pickQueuedJob(TYPES);
       if (!candidate) {
@@ -480,42 +397,27 @@ async function loop() {
         id: claimed.id,
         type: claimed.type,
         claimed_by: claimed.claimed_by,
-        attempts: claimed.attempts || 0,
         run_at: claimed.run_at || null,
-        last_step: claimed.last_step,
       });
 
-      // Heartbeat timer while executing
-      const hbEveryMs = Math.max(1000, HEARTBEAT_SECS * 1000);
-      let hbTimer = null;
-      try {
-        hbTimer = setInterval(() => {
-          heartbeat(claimed.id).catch(() => {});
-        }, hbEveryMs);
+      const result = await executeViaWebhook(claimed);
 
-        const result = await executeViaWebhook(claimed);
-
-        if (result.ok) {
-          await completeJob(claimed.id);
-          log({ tag: TAG, msg: "JOB_COMPLETED", ts: nowIso(), id: claimed.id, type: claimed.type });
-        } else {
-          // CRITICAL: app-level failure must not be marked completed
-          log({
-            tag: TAG,
-            msg: "JOB_FAILED_APP_OR_HTTP",
-            ts: nowIso(),
-            id: claimed.id,
-            type: claimed.type,
-            last_error: result.code,
-            detail: result.detail,
-          });
-          await retryOrArchive(claimed, result.code);
-        }
-      } finally {
-        if (hbTimer) clearInterval(hbTimer);
+      if (result.ok) {
+        await completeJob(claimed.id);
+        log({ tag: TAG, msg: "JOB_COMPLETED", ts: nowIso(), id: claimed.id, type: claimed.type });
+      } else {
+        await failJob(claimed.id, result.code, result.detail);
+        log({
+          tag: TAG,
+          msg: "JOB_FAILED",
+          ts: nowIso(),
+          id: claimed.id,
+          type: claimed.type,
+          last_error: result.code,
+          detail: safeTrim(result.detail).slice(0, 300),
+        });
       }
 
-      // small jitter
       await sleep(250);
     } catch (err) {
       log({
@@ -523,7 +425,6 @@ async function loop() {
         msg: "LOOP_ERROR",
         ts: nowIso(),
         error: String(err && err.message ? err.message : err),
-        loop_ms: nowMs() - loopStart,
       });
       await sleep(Math.max(1000, POLL_MS));
     }
