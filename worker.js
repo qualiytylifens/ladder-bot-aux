@@ -15,7 +15,7 @@
  *
  * Self-heal (optional):
  *  - Requeues deadlettered EXIT/CLOSE jobs only if trade is still OPEN (paper mode)
- *  - Archives the old dead job for clean history
+ *  - IMPORTANT: requeues the SAME ROW to avoid ux_execution_jobs_intent_type duplicates
  *
  * Env vars:
  *  - SUPABASE_URL
@@ -344,45 +344,38 @@ async function tradeIsOpen(tradeId) {
   return String(row.status || "").toLowerCase() === "open";
 }
 
-async function archiveJob(jobId, note) {
+/**
+ * IMPORTANT:
+ * We MUST NOT insert a new job with same (intent_id,type) because of ux_execution_jobs_intent_type.
+ * Selfheal should "revive" the SAME ROW by resetting it back to queued.
+ */
+async function selfhealRequeueSameJob(oldJob, patchPayload) {
   const now = nowIso();
+  const mergedPayload = {
+    ...(oldJob.payload || {}),
+    ...(patchPayload || {}),
+    selfheal_prev_status: oldJob.status,
+    selfheal_prev_last_error: oldJob.last_error,
+    selfheal_prev_last_step: oldJob.last_step,
+    selfheal_at: now,
+    created_from: "worker_selfheal_requeue_deadletter",
+  };
+
   const { error } = await sb
     .from("execution_jobs")
     .update({
-      status: "archived",
+      status: "queued",
+      attempts: 0,
+      run_at: now,
+      claimed_by: null,
+      claimed_at: null,
       heartbeat_at: now,
-      last_step: "archived_by_selfheal",
-      last_error: note || "archived_by_selfheal",
+      last_error: null,
+      last_step: "selfheal_requeued",
+      payload: mergedPayload,
     })
-    .eq("id", jobId);
+    .eq("id", oldJob.id);
 
-  if (error) throw error;
-}
-
-async function insertNewQueuedJobFrom(oldJob, patchPayload) {
-  const now = nowIso();
-  const row = {
-    created_at: now,
-    run_at: now,
-    intent_id: oldJob.intent_id || null,
-    type: oldJob.type || "execute_intent",
-    payload: {
-      ...(oldJob.payload || {}),
-      ...(patchPayload || {}),
-      prev_job_id: oldJob.id,
-      created_from: "worker_selfheal_requeue_deadletter",
-    },
-    status: "queued",
-    attempts: 0,
-    last_error: null,
-    claimed_by: null,
-    claimed_at: null,
-    heartbeat_at: null,
-    run_id: null,
-    last_step: "selfheal_requeued",
-  };
-
-  const { error } = await sb.from("execution_jobs").insert([row]);
   if (error) throw error;
 }
 
@@ -391,7 +384,7 @@ async function selfhealDeadletters(batch) {
 
   const { data: dead, error } = await sb
     .from("execution_jobs")
-    .select("id,intent_id,type,status,payload,created_at,run_at,last_error,last_step")
+    .select("id,intent_id,type,status,payload,created_at,run_at,last_error,last_step,attempts")
     .eq("status", "failed")
     .eq("last_error", "deadletter_max_attempts")
     .order("created_at", { ascending: true })
@@ -425,14 +418,12 @@ async function selfhealDeadletters(batch) {
     const open = await tradeIsOpen(tradeId);
     if (open !== true) continue;
 
-    await insertNewQueuedJobFrom(j, {
+    await selfhealRequeueSameJob(j, {
       action,
       symbol: (j.payload && j.payload.symbol) || (intent ? intent.symbol : null),
       execution_mode: (j.payload && j.payload.execution_mode) || (intent ? intent.execution_mode : "paper"),
       trade_id: tradeId,
     });
-
-    await archiveJob(j.id, "selfheal_archived_after_requeue");
 
     requeued += 1;
 
@@ -440,7 +431,7 @@ async function selfhealDeadletters(batch) {
       tag: TAG,
       msg: "SELFHEAL_REQUEUED",
       ts: nowIso(),
-      prev_job_id: j.id,
+      job_id: j.id,
       intent_id: j.intent_id,
       trade_id: tradeId,
       action,
