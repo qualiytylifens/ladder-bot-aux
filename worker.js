@@ -603,6 +603,52 @@ async function ensureCloseLedgerForJob(job) {
 }
 
 // ---------- selfheal helpers ----------
+
+function toPairFromSymbol(sym) {
+  const s = safeTrim(sym);
+  if (!s) return null;
+  return s.includes("-") ? s : `${s}-USDC`;
+}
+
+function pickPairFromJobAndIntent(job, intent) {
+  const p = job && job.payload ? job.payload : {};
+  const i = intent && intent.raw_signal ? intent.raw_signal : {};
+
+  return (
+    safeTrim(p.pair) ||
+    safeTrim(i.pair) ||
+    safeTrim(i["pair"]) ||
+    (p.symbol ? toPairFromSymbol(p.symbol) : null) ||
+    (intent && intent.symbol ? toPairFromSymbol(intent.symbol) : null) ||
+    null
+  );
+}
+
+async function resolveOpenPaperTradeIdByPair(pair) {
+  const pr = safeTrim(pair);
+  if (!pr) return null;
+
+  // NOTE: mode is stored in metadata->>'mode' in your schema (paper/live).
+  // We only selfheal paper CLOSEs here to avoid touching live.
+  const { data, error } = await sb
+    .from("trades_prod")
+    .select("id,status,metadata,created_at")
+    .eq("status", "open")
+    .eq("symbol", pr)
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  if (error) throw error;
+
+  for (const row of data || []) {
+    const mode = row.metadata && (row.metadata.mode || row.metadata["mode"]);
+    if (mode && String(mode) !== "paper") continue;
+    return row.id;
+  }
+
+  return null;
+}
+
 async function tradeIsOpen(tradeId) {
   if (!tradeId) return null;
   const { data, error } = await sb.from("trades_prod").select("id,status,metadata").eq("id", tradeId).limit(1);
@@ -659,7 +705,7 @@ async function selfhealDeadletters(batch) {
     .from("execution_jobs")
     .select("id,intent_id,type,status,payload,created_at,run_at,last_error,last_step,attempts")
     .eq("status", "failed")
-    .eq("last_error", "deadletter_max_attempts")
+    .in("last_error", ["deadletter_max_attempts","postcheck_trade_still_open"])
     .order("created_at", { ascending: true })
     .limit(batch);
 
@@ -684,9 +730,16 @@ async function selfhealDeadletters(batch) {
     const action = (j.payload && j.payload.action) || (intent ? intent.action : null);
     if (!isExitAction(action)) continue;
 
-    const tradeId =
+    let tradeId =
       (j.payload && j.payload.trade_id) ||
       (intent && intent.raw_signal ? intent.raw_signal.trade_id || intent.raw_signal["trade_id"] : null);
+
+    const pair = pickPairFromJobAndIntent(j, intent);
+
+    // If intent/payload didn't carry trade_id, resolve by pair -> most recent OPEN paper trade.
+    if (!tradeId && pair) {
+      tradeId = await resolveOpenPaperTradeIdByPair(pair);
+    }
 
     const open = await tradeIsOpen(tradeId);
     if (open !== true) continue;
@@ -694,6 +747,7 @@ async function selfhealDeadletters(batch) {
     await selfhealRequeueSameJob(j, {
       action,
       symbol: (j.payload && j.payload.symbol) || (intent ? intent.symbol : null),
+      pair,
       execution_mode: (j.payload && j.payload.execution_mode) || (intent ? intent.execution_mode : "paper"),
       trade_id: tradeId,
     });
