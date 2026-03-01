@@ -33,9 +33,16 @@
  *  - RETRY_BACKOFF_MS (default 5000)   // base backoff; multiplied by attempts
  *  - SELFHEAL_DEADLETTER (default 1)
  *  - SELFHEAL_BATCH (default 25)
+ *
+ * Option 1 (Institutional fix for CLOSE ledger):
+ *  - After a successful webhook execution of a CLOSE intent, this worker writes the append-only
+ *    close row into trade_executions_prod (intent_id required), so existing DB triggers can
+ *    finalize the trade.
+ *  - This keeps Supabase as sovereign authority and respects append-only constraints.
  */
 
 const { createClient } = require("@supabase/supabase-js");
+const { randomUUID } = require("crypto");
 
 // ---------- helpers ----------
 function nowIso() {
@@ -75,6 +82,7 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    // Node 18+ has global fetch
     return await fetch(url, { ...opts, signal: controller.signal });
   } finally {
     clearTimeout(id);
@@ -95,6 +103,17 @@ function msBackoff(baseMs, attempts) {
   const n = Math.max(1, Number(attempts || 0) + 1);
   return baseMs * n;
 }
+function toNum(v) {
+  if (v === null || v === undefined) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function normalizePairFromSymbol(s) {
+  const sym = safeTrim(s);
+  if (!sym) return null;
+  if (sym.includes("-")) return sym;
+  return `${sym}-USDC`;
+}
 
 // ---------- config ----------
 const TAG = "AUX";
@@ -109,6 +128,13 @@ const RETRY_BACKOFF_MS = envInt("RETRY_BACKOFF_MS", 5000);
 
 const SELFHEAL_DEADLETTER = envBool("SELFHEAL_DEADLETTER", true);
 const SELFHEAL_BATCH = envInt("SELFHEAL_BATCH", 25);
+
+// Option 1 toggle (default ON, because this is the institutional fix you selected)
+const CLOSE_LEDGER_ENABLED = envBool("CLOSE_LEDGER_ENABLED", true);
+
+// If your ladder-bot also writes the close ledger in the future, set this true to skip DB insert
+// when ladder-bot already did it. Default false to ensure ledger exists.
+const CLOSE_LEDGER_ASSUME_BOT_WRITES = envBool("CLOSE_LEDGER_ASSUME_BOT_WRITES", false);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -137,6 +163,8 @@ log({
   RETRY_BACKOFF_MS,
   SELFHEAL_DEADLETTER,
   SELFHEAL_BATCH,
+  CLOSE_LEDGER_ENABLED,
+  CLOSE_LEDGER_ASSUME_BOT_WRITES,
   hasSupabase,
   hasWebhook,
   hasApiSecret,
@@ -329,6 +357,251 @@ async function executeViaWebhook(job) {
   return { ok: true, code: "ok", detail: text.slice(0, 500) };
 }
 
+// ---------- Option 1: CLOSE ledger writer (append-only) ----------
+async function fetchIntent(intentId) {
+  if (!intentId) return null;
+  const { data, error } = await sb
+    .from("execution_intents")
+    .select("id,raw_signal,action,symbol,execution_mode")
+    .eq("id", intentId)
+    .limit(1);
+  if (error) throw error;
+  return data && data[0] ? data[0] : null;
+}
+
+async function findOpenPaperTradeByPair(pair) {
+  if (!pair) return null;
+  const { data, error } = await sb
+    .from("trades_prod")
+    .select("id,amount,status,metadata,created_at")
+    .eq("symbol", pair)
+    .eq("status", "open")
+    .order("created_at", { ascending: false })
+    .limit(5);
+  if (error) throw error;
+
+  const rows = data || [];
+  // prefer explicit paper mode
+  for (const r of rows) {
+    const mode =
+      r.metadata && (r.metadata.mode || r.metadata["mode"])
+        ? String(r.metadata.mode || r.metadata["mode"])
+        : "";
+    if (!mode || mode === "paper") return r;
+  }
+  return rows[0] || null;
+}
+
+async function getTradeAmount(tradeId, tradeRowMaybe) {
+  if (tradeRowMaybe && tradeRowMaybe.amount != null) {
+    const n = toNum(tradeRowMaybe.amount);
+    if (n && n > 0) return n;
+  }
+
+  // sum fills as fallback
+  const { data, error } = await sb
+    .from("trade_executions_prod")
+    .select("amount,execution_type")
+    .eq("trade_id", tradeId)
+    .eq("execution_type", "fill")
+    .order("executed_at", { ascending: false })
+    .limit(1000);
+  if (error) throw error;
+
+  const fills = data || [];
+  let sum = 0;
+  for (const f of fills) {
+    const n = toNum(f.amount);
+    if (n && n > 0) sum += n;
+  }
+  if (sum > 0) return sum;
+
+  // final fallback (keeps system moving)
+  return 50;
+}
+
+async function hasAnyFill(tradeId) {
+  const { data, error } = await sb
+    .from("trade_executions_prod")
+    .select("id")
+    .eq("trade_id", tradeId)
+    .eq("execution_type", "fill")
+    .limit(1);
+  if (error) throw error;
+  return Boolean(data && data[0]);
+}
+
+async function getPriceFromMarketMarks(pair) {
+  if (!pair) return null;
+  const { data, error } = await sb
+    .from("market_marks")
+    .select("price,marked_at")
+    .eq("symbol", pair)
+    .order("marked_at", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return data && data[0] ? toNum(data[0].price) : null;
+}
+
+async function getLastFillPrice(tradeId) {
+  const { data, error } = await sb
+    .from("trade_executions_prod")
+    .select("price,executed_at")
+    .eq("trade_id", tradeId)
+    .eq("execution_type", "fill")
+    .order("executed_at", { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return data && data[0] ? toNum(data[0].price) : null;
+}
+
+async function closeAlreadyWrittenForIntent(intentId) {
+  const { data, error } = await sb
+    .from("trade_executions_prod")
+    .select("id")
+    .eq("intent_id", intentId)
+    .eq("execution_type", "close")
+    .limit(1);
+  if (error) throw error;
+  return Boolean(data && data[0]);
+}
+
+async function writeCloseLedgerRow({ job, intentId, tradeId, pair, amount, price, priceSource, mode }) {
+  const execId = randomUUID();
+
+  const row = {
+    id: execId,
+    trade_id: tradeId,
+    intent_id: intentId,
+    execution_type: "close",
+    executed_at: nowIso(),
+    price: price,
+    amount: amount,
+    fee: 0,
+    fee_currency: "USD",
+    exchange: "paper",
+    metadata: {
+      source: "worker_close_ledger",
+      job_id: String(job.id),
+      pair: pair,
+      price_source: priceSource,
+      mode: mode,
+      worker_id: WORKER_ID,
+    },
+    created_at: nowIso(),
+  };
+
+  const { error } = await sb.from("trade_executions_prod").insert(row);
+  if (error) throw error;
+  return execId;
+}
+
+async function ensureCloseLedgerForJob(job) {
+  try {
+    if (!CLOSE_LEDGER_ENABLED) return { ok: true, did: false, code: "disabled" };
+    if (CLOSE_LEDGER_ASSUME_BOT_WRITES) return { ok: true, did: false, code: "assume_bot_writes" };
+    if (!job || job.type !== "execute_intent") return { ok: true, did: false, code: "not_execute_intent" };
+
+    const payload = job.payload || {};
+    const action = safeTrim(payload.action);
+    if (!isExitAction(action)) return { ok: true, did: false, code: "not_close" };
+
+    const intentId = safeTrim(job.intent_id || payload.intent_id || payload.intentId);
+    if (!intentId) {
+      return { ok: false, did: false, code: "close_ledger_missing_intent_id", detail: "job.intent_id missing" };
+    }
+
+    // If already written, weâre done.
+    if (await closeAlreadyWrittenForIntent(intentId)) {
+      return { ok: true, did: false, code: "close_already_written" };
+    }
+
+    const intent = await fetchIntent(intentId).catch((e) => {
+      log({ tag: TAG, msg: "CLOSE_LEDGER_INTENT_FETCH_ERROR", ts: nowIso(), intent_id: intentId, error: e.message });
+      return null;
+    });
+
+    const pair =
+      safeTrim(payload.pair) ||
+      safeTrim(intent && intent.raw_signal ? intent.raw_signal.pair || intent.raw_signal["pair"] : "") ||
+      normalizePairFromSymbol(payload.symbol || (intent ? intent.symbol : null));
+
+    const mode =
+      safeTrim(payload.execution_mode) ||
+      safeTrim(intent ? intent.execution_mode : "") ||
+      "paper";
+
+    let tradeId =
+      safeTrim(payload.trade_id) ||
+      safeTrim(intent && intent.raw_signal ? intent.raw_signal.trade_id || intent.raw_signal["trade_id"] : "");
+
+    let tradeRow = null;
+    if (!tradeId) {
+      tradeRow = await findOpenPaperTradeByPair(pair);
+      tradeId = tradeRow ? tradeRow.id : null;
+    } else {
+      // fetch minimal trade row for amount fallback
+      const { data, error } = await sb
+        .from("trades_prod")
+        .select("id,amount,metadata,status,created_at")
+        .eq("id", tradeId)
+        .limit(1);
+      if (error) throw error;
+      tradeRow = data && data[0] ? data[0] : null;
+    }
+
+    if (!tradeId) {
+      return { ok: false, did: false, code: "close_ledger_no_trade_found", detail: `pair=${pair || "(null)"}` };
+    }
+
+    // Enforce the same guard your DB trigger enforces: close requires prior fill.
+    const hasFill = await hasAnyFill(tradeId);
+    if (!hasFill) {
+      return { ok: false, did: false, code: "close_ledger_missing_fill", detail: `trade_id=${tradeId}` };
+    }
+
+    const amount = await getTradeAmount(tradeId, tradeRow);
+    const priceMarks = await getPriceFromMarketMarks(pair);
+    const priceLastFill = await getLastFillPrice(tradeId);
+
+    const price = priceMarks != null ? priceMarks : priceLastFill;
+    const priceSource = priceMarks != null ? "market_marks" : priceLastFill != null ? "last_fill" : null;
+
+    if (price == null) {
+      return { ok: false, did: false, code: "close_ledger_missing_price", detail: `pair=${pair} trade_id=${tradeId}` };
+    }
+
+    const execId = await writeCloseLedgerRow({
+      job,
+      intentId,
+      tradeId,
+      pair,
+      amount,
+      price,
+      priceSource,
+      mode,
+    });
+
+    log({
+      tag: TAG,
+      msg: "CLOSE_LEDGER_WRITTEN",
+      ts: nowIso(),
+      job_id: job.id,
+      intent_id: intentId,
+      trade_id: tradeId,
+      exec_id: execId,
+      pair,
+      price,
+      amount,
+      price_source: priceSource,
+    });
+
+    return { ok: true, did: true, code: "close_ledger_written", exec_id: execId };
+  } catch (err) {
+    return { ok: false, did: false, code: "close_ledger_exception", detail: String(err && err.message ? err.message : err) };
+  }
+}
+
 // ---------- selfheal helpers ----------
 async function tradeIsOpen(tradeId) {
   if (!tradeId) return null;
@@ -476,8 +749,52 @@ async function loop() {
       const result = await executeViaWebhook(claimed);
 
       if (result.ok) {
+        // OPTION 1: ensure CLOSE ledger exists for CLOSE intents
+        const ledger = await ensureCloseLedgerForJob(claimed);
+
+        if (!ledger.ok) {
+          // Treat ledger failure as a job failure so we retry (this is the real fix).
+          const attempts = Number(claimed.attempts || 0);
+          const errCode = ledger.code || "close_ledger_failed";
+
+          if (attempts + 1 >= MAX_ATTEMPTS) {
+            await markFailedDeadletter(claimed.id, "deadletter_max_attempts");
+            log({
+              tag: TAG,
+              msg: "JOB_DEADLETTERED_CLOSE_LEDGER",
+              ts: nowIso(),
+              id: claimed.id,
+              type: claimed.type,
+              last_error: errCode,
+              detail: ledger.detail,
+            });
+          } else {
+            await requeueWithBackoff(claimed, errCode);
+            log({
+              tag: TAG,
+              msg: "JOB_CLOSE_LEDGER_FAILED_RETRYING",
+              ts: nowIso(),
+              id: claimed.id,
+              type: claimed.type,
+              last_error: errCode,
+              detail: ledger.detail,
+            });
+          }
+
+          await sleep(250);
+          continue;
+        }
+
         await completeJob(claimed.id);
-        log({ tag: TAG, msg: "JOB_COMPLETED", ts: nowIso(), id: claimed.id, type: claimed.type });
+
+        log({
+          tag: TAG,
+          msg: "JOB_COMPLETED",
+          ts: nowIso(),
+          id: claimed.id,
+          type: claimed.type,
+          close_ledger: ledger.code,
+        });
       } else {
         const attempts = Number(claimed.attempts || 0);
 
