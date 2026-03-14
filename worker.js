@@ -25,6 +25,7 @@
  *  - TYPES (e.g. "execute_intent" or JSON '["execute_intent"]')
  *  - POLL_MS (default 2000)
  *  - JOB_TIMEOUT_MS (default 60000)
+ *  - JOB_HEARTBEAT_MS (default 15000)
  *  - WORKER_WEBHOOK_URL (e.g. https://ladder-bot-production.up.railway.app/webhook/worker)
  *  - API_SECRET (must match ladder-bot API_SECRET)
  *
@@ -122,6 +123,7 @@ const WORKER_ID = process.env.WORKER_ID || "ladder-worker-1";
 const TYPES = parseTypes(process.env.TYPES || process.env.WORKER_TYPES || "execute_intent");
 const POLL_MS = envInt("POLL_MS", 2000);
 const JOB_TIMEOUT_MS = envInt("JOB_TIMEOUT_MS", 60000);
+const JOB_HEARTBEAT_MS = envInt("JOB_HEARTBEAT_MS", 15000);
 
 const MAX_ATTEMPTS = envInt("MAX_ATTEMPTS", 3);
 const RETRY_BACKOFF_MS = envInt("RETRY_BACKOFF_MS", 5000);
@@ -159,6 +161,7 @@ log({
   TYPES,
   POLL_MS,
   JOB_TIMEOUT_MS,
+  JOB_HEARTBEAT_MS,
   MAX_ATTEMPTS,
   RETRY_BACKOFF_MS,
   SELFHEAL_DEADLETTER,
@@ -206,6 +209,37 @@ if (hasWebhook && !hasApiSecret) {
 const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false },
 });
+
+// ---------- job lifecycle helpers ----------
+async function touchHeartbeat(jobId, step = "processing") {
+  const { error } = await sb
+    .from("execution_jobs")
+    .update({
+      heartbeat_at: nowIso(),
+      last_step: step,
+    })
+    .eq("id", jobId)
+    .eq("claimed_by", WORKER_ID)
+    .eq("status", "running");
+
+  if (error) throw error;
+}
+
+function startHeartbeat(jobId, intervalMs = JOB_HEARTBEAT_MS) {
+  const timer = setInterval(() => {
+    touchHeartbeat(jobId, "processing").catch((err) => {
+      log({
+        tag: TAG,
+        msg: "HEARTBEAT_ERROR",
+        ts: nowIso(),
+        job_id: jobId,
+        error: String(err && err.message ? err.message : err),
+      });
+    });
+  }, intervalMs);
+
+  return () => clearInterval(timer);
+}
 
 // ---------- core DB ops ----------
 async function pickQueuedJob(types) {
@@ -511,7 +545,7 @@ async function ensureCloseLedgerForJob(job) {
       return { ok: false, did: false, code: "close_ledger_missing_intent_id", detail: "job.intent_id missing" };
     }
 
-    // If already written, weâre done.
+    // If already written, we're done.
     if (await closeAlreadyWrittenForIntent(intentId)) {
       return { ok: true, did: false, code: "close_already_written" };
     }
@@ -641,8 +675,8 @@ async function resolveOpenPaperTradeIdByPair(pair) {
   if (error) throw error;
 
   for (const row of data || []) {
-    const mode = row.metadata && (row.metadata.mode || row.metadata["mode"]);
-    if (mode && String(mode) !== "paper") continue;
+    const mode = row.metadata && row.metadata.mode ? String(row.metadata.mode) : null;
+    if (mode && mode !== "paper") continue;
     return row.id;
   }
 
@@ -705,7 +739,7 @@ async function selfhealDeadletters(batch) {
     .from("execution_jobs")
     .select("id,intent_id,type,status,payload,created_at,run_at,last_error,last_step,attempts")
     .eq("status", "failed")
-    .in("last_error", ["deadletter_max_attempts","postcheck_trade_still_open"])
+    .in("last_error", ["deadletter_max_attempts", "postcheck_trade_still_open"])
     .order("created_at", { ascending: true })
     .limit(batch);
 
@@ -800,10 +834,19 @@ async function loop() {
         attempts: claimed.attempts,
       });
 
-      const result = await executeViaWebhook(claimed);
+      await touchHeartbeat(claimed.id, "webhook_dispatch");
+      const stopHeartbeat = startHeartbeat(claimed.id, JOB_HEARTBEAT_MS);
+
+      let result;
+      try {
+        result = await executeViaWebhook(claimed);
+      } finally {
+        stopHeartbeat();
+      }
 
       if (result.ok) {
         // OPTION 1: ensure CLOSE ledger exists for CLOSE intents
+        await touchHeartbeat(claimed.id, "close_ledger");
         const ledger = await ensureCloseLedgerForJob(claimed);
 
         if (!ledger.ok) {
@@ -839,6 +882,7 @@ async function loop() {
           continue;
         }
 
+        await touchHeartbeat(claimed.id, "finalizing");
         await completeJob(claimed.id);
 
         log({
