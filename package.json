@@ -1,6 +1,6 @@
 {
   "name": "ladder-bot-aux",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Coin-Smart execution worker (Supabase job runner)",
   "main": "worker.js",
   "type": "commonjs",
@@ -8,9 +8,18 @@
     "start": "node worker.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": "20.x"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1"
-  }
+  },
+  "keywords": [
+    "worker",
+    "execution",
+    "supabase",
+    "coin-smart",
+    "job-runner"
+  ],
+  "author": "Coin-Smart",
+  "license": "MIT"
 }
