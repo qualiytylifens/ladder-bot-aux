@@ -31,7 +31,7 @@
  *
  * Optional:
  *  - MAX_ATTEMPTS (default 3)
- *  - RETRY_BACKOFF_MS (default 5000)   // base backoff; multiplied by attempts
+ *  - RETRY_BACKOFF_MS (default 5000)
  *  - SELFHEAL_DEADLETTER (default 1)
  *  - SELFHEAL_BATCH (default 25)
  *
@@ -40,6 +40,16 @@
  *    close row into trade_executions_prod (intent_id required), so existing DB triggers can
  *    finalize the trade.
  *  - This keeps Supabase as sovereign authority and respects append-only constraints.
+ *
+ * Alpha policy preflight:
+ *  - Entry intents are preflight-checked against public.alpha_decision_policy_v2
+ *  - If policy says FLAT_ONLY / TIER_0 / wrong side, worker completes job as skipped
+ *  - Exits / closes always bypass policy preflight
+ *
+ * Strategic note:
+ *  - Paper mode is validation.
+ *  - Live money is the destination.
+ *  - This patch keeps policy enforcement reusable for both paper and future live execution.
  */
 
 const { createClient } = require("@supabase/supabase-js");
@@ -83,7 +93,6 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    // Node 18+ has global fetch
     return await fetch(url, { ...opts, signal: controller.signal });
   } finally {
     clearTimeout(id);
@@ -99,8 +108,11 @@ function isExitAction(action) {
   const a = String(action || "").toLowerCase();
   return a === "close" || a === "exit" || a === "sell";
 }
+function isEntryAction(action) {
+  const a = String(action || "").toLowerCase();
+  return a === "buy" || a === "long" || a === "sell" || a === "short";
+}
 function msBackoff(baseMs, attempts) {
-  // attempts starts at 0 in your rows; backoff uses (attempts+1)
   const n = Math.max(1, Number(attempts || 0) + 1);
   return baseMs * n;
 }
@@ -114,6 +126,19 @@ function normalizePairFromSymbol(s) {
   if (!sym) return null;
   if (sym.includes("-")) return sym;
   return `${sym}-USDC`;
+}
+function normalizePolicySymbol(payload, intent) {
+  return (
+    safeTrim(payload?.pair) ||
+    normalizePairFromSymbol(payload?.symbol || (intent ? intent.symbol : null)) ||
+    null
+  );
+}
+function normalizeIntentSide(action) {
+  const a = String(action || "").toLowerCase();
+  if (a === "buy" || a === "long") return "LONG";
+  if (a === "sell" || a === "short") return "SHORT";
+  return "UNKNOWN";
 }
 
 // ---------- config ----------
@@ -131,11 +156,7 @@ const RETRY_BACKOFF_MS = envInt("RETRY_BACKOFF_MS", 5000);
 const SELFHEAL_DEADLETTER = envBool("SELFHEAL_DEADLETTER", true);
 const SELFHEAL_BATCH = envInt("SELFHEAL_BATCH", 25);
 
-// Option 1 toggle (default ON, because this is the institutional fix you selected)
 const CLOSE_LEDGER_ENABLED = envBool("CLOSE_LEDGER_ENABLED", true);
-
-// If your ladder-bot also writes the close ledger in the future, set this true to skip DB insert
-// when ladder-bot already did it. Default false to ensure ledger exists.
 const CLOSE_LEDGER_ASSUME_BOT_WRITES = envBool("CLOSE_LEDGER_ASSUME_BOT_WRITES", false);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -241,55 +262,6 @@ function startHeartbeat(jobId, intervalMs = JOB_HEARTBEAT_MS) {
   return () => clearInterval(timer);
 }
 
-// ---------- core DB ops ----------
-async function pickQueuedJob(types) {
-  const now = nowIso();
-
-  // IMPORTANT: only runnable now (run_at is null OR run_at <= now)
-  const { data, error } = await sb
-    .from("execution_jobs")
-    .select(
-      "id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at,intent_id"
-    )
-    .in("type", types)
-    .eq("status", "queued")
-    .is("claimed_by", null)
-    .or(`run_at.is.null,run_at.lte.${now}`)
-    .order("run_at", { ascending: true })
-    .order("created_at", { ascending: true })
-    .limit(1);
-
-  if (error) throw error;
-  return data && data[0] ? data[0] : null;
-}
-
-async function claimJob(jobId) {
-  const now = nowIso();
-
-  // Atomic claim: only if still queued + unclaimed + runnable now
-  const { data, error } = await sb
-    .from("execution_jobs")
-    .update({
-      status: "running",
-      claimed_by: WORKER_ID,
-      claimed_at: now,
-      heartbeat_at: now,
-      last_step: "claimed",
-      last_error: null,
-    })
-    .eq("id", jobId)
-    .eq("status", "queued")
-    .is("claimed_by", null)
-    .or(`run_at.is.null,run_at.lte.${now}`)
-    .select(
-      "id,type,status,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at,intent_id"
-    )
-    .limit(1);
-
-  if (error) throw error;
-  return data && data[0] ? data[0] : null;
-}
-
 async function completeJob(jobId) {
   const now = nowIso();
   const { error } = await sb
@@ -298,6 +270,22 @@ async function completeJob(jobId) {
       status: "completed",
       heartbeat_at: now,
       last_step: "completed",
+    })
+    .eq("id", jobId)
+    .eq("claimed_by", WORKER_ID);
+
+  if (error) throw error;
+}
+
+async function completeJobSkipped(jobId, step, note) {
+  const now = nowIso();
+  const { error } = await sb
+    .from("execution_jobs")
+    .update({
+      status: "completed",
+      heartbeat_at: now,
+      last_step: step || "policy_skipped",
+      last_error: note || null,
     })
     .eq("id", jobId)
     .eq("claimed_by", WORKER_ID);
@@ -355,6 +343,53 @@ async function requeueWithBackoff(job, lastErrorCode) {
   });
 }
 
+// ---------- core DB ops ----------
+async function pickQueuedJob(types) {
+  const now = nowIso();
+
+  const { data, error } = await sb
+    .from("execution_jobs")
+    .select(
+      "id,type,status,payload,attempts,created_at,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at,intent_id"
+    )
+    .in("type", types)
+    .eq("status", "queued")
+    .is("claimed_by", null)
+    .or(`run_at.is.null,run_at.lte.${now}`)
+    .order("run_at", { ascending: true })
+    .order("created_at", { ascending: true })
+    .limit(1);
+
+  if (error) throw error;
+  return data && data[0] ? data[0] : null;
+}
+
+async function claimJob(jobId) {
+  const now = nowIso();
+
+  const { data, error } = await sb
+    .from("execution_jobs")
+    .update({
+      status: "running",
+      claimed_by: WORKER_ID,
+      claimed_at: now,
+      heartbeat_at: now,
+      last_step: "claimed",
+      last_error: null,
+    })
+    .eq("id", jobId)
+    .eq("status", "queued")
+    .is("claimed_by", null)
+    .or(`run_at.is.null,run_at.lte.${now}`)
+    .select(
+      "id,type,status,payload,attempts,claimed_by,claimed_at,heartbeat_at,last_step,last_error,run_at,intent_id"
+    )
+    .limit(1);
+
+  if (error) throw error;
+  return data && data[0] ? data[0] : null;
+}
+
 // ---------- webhook execution ----------
 async function executeViaWebhook(job) {
   if (!hasWebhook) {
@@ -371,7 +406,6 @@ async function executeViaWebhook(job) {
 
   const headers = { "content-type": "application/json" };
   if (hasApiSecret) {
-    // include multiple common header styles for compatibility
     headers["x-api-secret"] = API_SECRET;
     headers["x-api-key"] = API_SECRET;
     headers["authorization"] = `Bearer ${API_SECRET}`;
@@ -391,7 +425,7 @@ async function executeViaWebhook(job) {
   return { ok: true, code: "ok", detail: text.slice(0, 500) };
 }
 
-// ---------- Option 1: CLOSE ledger writer (append-only) ----------
+// ---------- intent / policy helpers ----------
 async function fetchIntent(intentId) {
   if (!intentId) return null;
   const { data, error } = await sb
@@ -403,6 +437,91 @@ async function fetchIntent(intentId) {
   return data && data[0] ? data[0] : null;
 }
 
+async function fetchAlphaDecisionPolicy(symbol) {
+  const { data, error } = await sb
+    .from("alpha_decision_policy_v2")
+    .select("*")
+    .eq("symbol", symbol)
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data || null;
+}
+
+async function policyPreflight(job) {
+  if (!job || job.type !== "execute_intent") {
+    return { allow: true, code: "not_execute_intent" };
+  }
+
+  const payload = job.payload || {};
+  const action = safeTrim(payload.action);
+
+  // Exits / closes must always bypass preflight.
+  if (isExitAction(action)) {
+    return { allow: true, code: "exit_bypass" };
+  }
+
+  // Only gate entry-style actions.
+  if (!isEntryAction(action)) {
+    return { allow: true, code: "unknown_action_bypass" };
+  }
+
+  const intent = await fetchIntent(job.intent_id).catch(() => null);
+  const symbol = normalizePolicySymbol(payload, intent);
+
+  if (!symbol) {
+    return { allow: true, code: "missing_symbol_bypass" };
+  }
+
+  const policy = await fetchAlphaDecisionPolicy(symbol);
+
+  // Do not fail closed in worker if policy row is missing.
+  // Final entry authority remains in paperTrading.js / ladder-bot execution path.
+  if (!policy) {
+    return { allow: true, code: "policy_missing_bypass", symbol };
+  }
+
+  const side = normalizeIntentSide(action);
+  const sidePermission = safeTrim(policy.side_permission).toUpperCase();
+  const sizeTier = safeTrim(policy.size_tier).toUpperCase();
+
+  if (sidePermission === "FLAT_ONLY" || sizeTier === "TIER_0") {
+    return {
+      allow: false,
+      code: "policy_flat_only",
+      symbol,
+      policy,
+    };
+  }
+
+  if (side === "LONG" && sidePermission !== "LONG_ONLY") {
+    return {
+      allow: false,
+      code: "policy_long_not_allowed",
+      symbol,
+      policy,
+    };
+  }
+
+  if (side === "SHORT" && sidePermission !== "SHORT_ONLY") {
+    return {
+      allow: false,
+      code: "policy_short_not_allowed",
+      symbol,
+      policy,
+    };
+  }
+
+  return {
+    allow: true,
+    code: "policy_allow",
+    symbol,
+    policy,
+  };
+}
+
+// ---------- Option 1: CLOSE ledger writer (append-only) ----------
 async function findOpenPaperTradeByPair(pair) {
   if (!pair) return null;
   const { data, error } = await sb
@@ -415,7 +534,6 @@ async function findOpenPaperTradeByPair(pair) {
   if (error) throw error;
 
   const rows = data || [];
-  // prefer explicit paper mode
   for (const r of rows) {
     const mode =
       r.metadata && (r.metadata.mode || r.metadata["mode"])
@@ -432,7 +550,6 @@ async function getTradeAmount(tradeId, tradeRowMaybe) {
     if (n && n > 0) return n;
   }
 
-  // sum fills as fallback
   const { data, error } = await sb
     .from("trade_executions_prod")
     .select("amount,execution_type")
@@ -450,7 +567,6 @@ async function getTradeAmount(tradeId, tradeRowMaybe) {
   }
   if (sum > 0) return sum;
 
-  // final fallback (keeps system moving)
   return 50;
 }
 
@@ -545,13 +661,18 @@ async function ensureCloseLedgerForJob(job) {
       return { ok: false, did: false, code: "close_ledger_missing_intent_id", detail: "job.intent_id missing" };
     }
 
-    // If already written, we're done.
     if (await closeAlreadyWrittenForIntent(intentId)) {
       return { ok: true, did: false, code: "close_already_written" };
     }
 
     const intent = await fetchIntent(intentId).catch((e) => {
-      log({ tag: TAG, msg: "CLOSE_LEDGER_INTENT_FETCH_ERROR", ts: nowIso(), intent_id: intentId, error: e.message });
+      log({
+        tag: TAG,
+        msg: "CLOSE_LEDGER_INTENT_FETCH_ERROR",
+        ts: nowIso(),
+        intent_id: intentId,
+        error: e.message,
+      });
       return null;
     });
 
@@ -574,7 +695,6 @@ async function ensureCloseLedgerForJob(job) {
       tradeRow = await findOpenPaperTradeByPair(pair);
       tradeId = tradeRow ? tradeRow.id : null;
     } else {
-      // fetch minimal trade row for amount fallback
       const { data, error } = await sb
         .from("trades_prod")
         .select("id,amount,metadata,status,created_at")
@@ -588,7 +708,6 @@ async function ensureCloseLedgerForJob(job) {
       return { ok: false, did: false, code: "close_ledger_no_trade_found", detail: `pair=${pair || "(null)"}` };
     }
 
-    // Enforce the same guard your DB trigger enforces: close requires prior fill.
     const hasFill = await hasAnyFill(tradeId);
     if (!hasFill) {
       return { ok: false, did: false, code: "close_ledger_missing_fill", detail: `trade_id=${tradeId}` };
@@ -632,12 +751,16 @@ async function ensureCloseLedgerForJob(job) {
 
     return { ok: true, did: true, code: "close_ledger_written", exec_id: execId };
   } catch (err) {
-    return { ok: false, did: false, code: "close_ledger_exception", detail: String(err && err.message ? err.message : err) };
+    return {
+      ok: false,
+      did: false,
+      code: "close_ledger_exception",
+      detail: String(err && err.message ? err.message : err),
+    };
   }
 }
 
 // ---------- selfheal helpers ----------
-
 function toPairFromSymbol(sym) {
   const s = safeTrim(sym);
   if (!s) return null;
@@ -662,8 +785,6 @@ async function resolveOpenPaperTradeIdByPair(pair) {
   const pr = safeTrim(pair);
   if (!pr) return null;
 
-  // NOTE: mode is stored in metadata->>'mode' in your schema (paper/live).
-  // We only selfheal paper CLOSEs here to avoid touching live.
   const { data, error } = await sb
     .from("trades_prod")
     .select("id,status,metadata,created_at")
@@ -685,23 +806,21 @@ async function resolveOpenPaperTradeIdByPair(pair) {
 
 async function tradeIsOpen(tradeId) {
   if (!tradeId) return null;
-  const { data, error } = await sb.from("trades_prod").select("id,status,metadata").eq("id", tradeId).limit(1);
+  const { data, error } = await sb
+    .from("trades_prod")
+    .select("id,status,metadata")
+    .eq("id", tradeId)
+    .limit(1);
   if (error) throw error;
   const row = data && data[0] ? data[0] : null;
   if (!row) return null;
 
-  // optional: only selfheal paper trades
   const mode = row.metadata && row.metadata.mode ? String(row.metadata.mode) : null;
   if (mode && mode !== "paper") return false;
 
   return String(row.status || "").toLowerCase() === "open";
 }
 
-/**
- * IMPORTANT:
- * We MUST NOT insert a new job with same (intent_id,type) because of ux_execution_jobs_intent_type.
- * Selfheal should "revive" the SAME ROW by resetting it back to queued.
- */
 async function selfhealRequeueSameJob(oldJob, patchPayload) {
   const now = nowIso();
   const mergedPayload = {
@@ -746,7 +865,6 @@ async function selfhealDeadletters(batch) {
   if (error) throw error;
   if (!dead || dead.length === 0) return 0;
 
-  // pull intents only to access raw_signal.trade_id (NO execution_intents.trade_id usage)
   const intentIds = dead.map((j) => j.intent_id).filter(Boolean);
   const { data: intents, error: e2 } = await sb
     .from("execution_intents")
@@ -770,7 +888,6 @@ async function selfhealDeadletters(batch) {
 
     const pair = pickPairFromJobAndIntent(j, intent);
 
-    // If intent/payload didn't carry trade_id, resolve by pair -> most recent OPEN paper trade.
     if (!tradeId && pair) {
       tradeId = await resolveOpenPaperTradeIdByPair(pair);
     }
@@ -808,7 +925,6 @@ async function loop() {
     try {
       log({ tag: TAG, msg: "POLL", ts: nowIso(), types: TYPES });
 
-      // opportunistic selfheal (safe; does nothing if none)
       await selfhealDeadletters(SELFHEAL_BATCH);
 
       const candidate = await pickQueuedJob(TYPES);
@@ -819,7 +935,6 @@ async function loop() {
 
       const claimed = await claimJob(candidate.id);
       if (!claimed) {
-        // race condition
         await sleep(250);
         continue;
       }
@@ -834,6 +949,37 @@ async function loop() {
         attempts: claimed.attempts,
       });
 
+      await touchHeartbeat(claimed.id, "policy_preflight");
+
+      const preflight = await policyPreflight(claimed);
+
+      if (!preflight.allow) {
+        await completeJobSkipped(
+          claimed.id,
+          `policy_skipped_${preflight.code}`,
+          preflight.code
+        );
+
+        log({
+          tag: TAG,
+          msg: "JOB_POLICY_SKIPPED",
+          ts: nowIso(),
+          id: claimed.id,
+          type: claimed.type,
+          intent_id: claimed.intent_id,
+          symbol: preflight.symbol || null,
+          code: preflight.code,
+          side_permission: preflight.policy?.side_permission || null,
+          size_tier: preflight.policy?.size_tier || null,
+          policy_reason: preflight.policy?.policy_reason || null,
+          direction_score: preflight.policy?.direction_score || null,
+          permission_score: preflight.policy?.permission_score || null,
+        });
+
+        await sleep(250);
+        continue;
+      }
+
       await touchHeartbeat(claimed.id, "webhook_dispatch");
       const stopHeartbeat = startHeartbeat(claimed.id, JOB_HEARTBEAT_MS);
 
@@ -845,12 +991,10 @@ async function loop() {
       }
 
       if (result.ok) {
-        // OPTION 1: ensure CLOSE ledger exists for CLOSE intents
         await touchHeartbeat(claimed.id, "close_ledger");
         const ledger = await ensureCloseLedgerForJob(claimed);
 
         if (!ledger.ok) {
-          // Treat ledger failure as a job failure so we retry (this is the real fix).
           const attempts = Number(claimed.attempts || 0);
           const errCode = ledger.code || "close_ledger_failed";
 
@@ -896,7 +1040,6 @@ async function loop() {
       } else {
         const attempts = Number(claimed.attempts || 0);
 
-        // IMPORTANT: persisted retry using DB attempts
         if (attempts + 1 >= MAX_ATTEMPTS) {
           await markFailedDeadletter(claimed.id, "deadletter_max_attempts");
           log({
