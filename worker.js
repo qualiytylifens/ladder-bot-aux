@@ -721,7 +721,12 @@ async function ensureCloseLedgerForJob(job) {
     const priceSource = priceMarks != null ? "market_marks" : priceLastFill != null ? "last_fill" : null;
 
     if (price == null) {
-      return { ok: false, did: false, code: "close_ledger_missing_price", detail: `pair=${pair} trade_id=${tradeId}` };
+      return {
+        ok: false,
+        did: false,
+        code: "close_ledger_missing_price",
+        detail: `pair=${pair} trade_id=${tradeId}`,
+      };
     }
 
     const execId = await writeCloseLedgerRow({
@@ -1071,7 +1076,25 @@ async function loop() {
         tag: TAG,
         msg: "LOOP_ERROR",
         ts: nowIso(),
-        error: String(err && err.message ? err.message : err),
+        error_message:
+          err && err.message ? err.message : String(err),
+        error_name:
+          err && err.name ? err.name : null,
+        error_code:
+          err && err.code ? err.code : null,
+        error_details:
+          err && err.details ? err.details : null,
+        error_hint:
+          err && err.hint ? err.hint : null,
+        error_stack:
+          err && err.stack ? err.stack : null,
+        error_json: (() => {
+          try {
+            return JSON.stringify(err);
+          } catch {
+            return null;
+          }
+        })(),
       });
       await sleep(Math.max(1000, POLL_MS));
     }
