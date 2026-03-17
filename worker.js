@@ -140,6 +140,23 @@ function normalizeIntentSide(action) {
   if (a === "sell" || a === "short") return "SHORT";
   return "UNKNOWN";
 }
+function summarizeUnknownError(err) {
+  return {
+    error_message: err && err.message ? err.message : String(err),
+    error_name: err && err.name ? err.name : null,
+    error_code: err && err.code ? err.code : null,
+    error_details: err && err.details ? err.details : null,
+    error_hint: err && err.hint ? err.hint : null,
+    error_stack: err && err.stack ? err.stack : null,
+    error_json: (() => {
+      try {
+        return JSON.stringify(err);
+      } catch {
+        return null;
+      }
+    })(),
+  };
+}
 
 // ---------- config ----------
 const TAG = "AUX";
@@ -457,12 +474,10 @@ async function policyPreflight(job) {
   const payload = job.payload || {};
   const action = safeTrim(payload.action);
 
-  // Exits / closes must always bypass preflight.
   if (isExitAction(action)) {
     return { allow: true, code: "exit_bypass" };
   }
 
-  // Only gate entry-style actions.
   if (!isEntryAction(action)) {
     return { allow: true, code: "unknown_action_bypass" };
   }
@@ -476,8 +491,6 @@ async function policyPreflight(job) {
 
   const policy = await fetchAlphaDecisionPolicy(symbol);
 
-  // Do not fail closed in worker if policy row is missing.
-  // Final entry authority remains in paperTrading.js / ladder-bot execution path.
   if (!policy) {
     return { allow: true, code: "policy_missing_bypass", symbol };
   }
@@ -930,15 +943,65 @@ async function loop() {
     try {
       log({ tag: TAG, msg: "POLL", ts: nowIso(), types: TYPES });
 
-      await selfhealDeadletters(SELFHEAL_BATCH);
+      log({
+        tag: TAG,
+        msg: "STEP_START",
+        ts: nowIso(),
+        step: "selfhealDeadletters",
+        batch: SELFHEAL_BATCH,
+      });
+      const selfhealCount = await selfhealDeadletters(SELFHEAL_BATCH);
+      log({
+        tag: TAG,
+        msg: "STEP_OK",
+        ts: nowIso(),
+        step: "selfhealDeadletters",
+        requeued: selfhealCount,
+      });
 
+      log({
+        tag: TAG,
+        msg: "STEP_START",
+        ts: nowIso(),
+        step: "pickQueuedJob",
+        types: TYPES,
+      });
       const candidate = await pickQueuedJob(TYPES);
+      log({
+        tag: TAG,
+        msg: "STEP_OK",
+        ts: nowIso(),
+        step: "pickQueuedJob",
+        found: Boolean(candidate),
+        candidate_id: candidate ? candidate.id : null,
+        candidate_type: candidate ? candidate.type : null,
+        candidate_intent_id: candidate ? candidate.intent_id : null,
+      });
+
       if (!candidate) {
         await sleep(POLL_MS);
         continue;
       }
 
+      log({
+        tag: TAG,
+        msg: "STEP_START",
+        ts: nowIso(),
+        step: "claimJob",
+        candidate_id: candidate.id,
+      });
       const claimed = await claimJob(candidate.id);
+      log({
+        tag: TAG,
+        msg: "STEP_OK",
+        ts: nowIso(),
+        step: "claimJob",
+        claimed: Boolean(claimed),
+        claimed_id: claimed ? claimed.id : null,
+        claimed_type: claimed ? claimed.type : null,
+        claimed_intent_id: claimed ? claimed.intent_id : null,
+      });
+
       if (!claimed) {
         await sleep(250);
         continue;
@@ -1076,25 +1139,7 @@ async function loop() {
         tag: TAG,
         msg: "LOOP_ERROR",
         ts: nowIso(),
-        error_message:
-          err && err.message ? err.message : String(err),
-        error_name:
-          err && err.name ? err.name : null,
-        error_code:
-          err && err.code ? err.code : null,
-        error_details:
-          err && err.details ? err.details : null,
-        error_hint:
-          err && err.hint ? err.hint : null,
-        error_stack:
-          err && err.stack ? err.stack : null,
-        error_json: (() => {
-          try {
-            return JSON.stringify(err);
-          } catch {
-            return null;
-          }
-        })(),
+        ...summarizeUnknownError(err),
       });
       await sleep(Math.max(1000, POLL_MS));
     }
