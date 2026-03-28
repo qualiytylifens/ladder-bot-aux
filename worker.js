@@ -43,7 +43,7 @@
  *
  * Alpha policy preflight:
  *  - Entry intents are preflight-checked against public.alpha_decision_policy_v2
- *  - If policy says FLAT_ONLY / TIER_0 / wrong side, worker completes job as skipped
+ *  - If policy says FLAT_ONLY / TIER_0 / wrong side, worker classifies job as cancelled
  *  - Exits / closes always bypass policy preflight
  *
  * Strategic note:
@@ -310,6 +310,22 @@ async function completeJobSkipped(jobId, step, note) {
   if (error) throw error;
 }
 
+async function cancelJobSkipped(jobId, step, note) {
+  const now = nowIso();
+  const { error } = await sb
+    .from("execution_jobs")
+    .update({
+      status: "cancelled",
+      heartbeat_at: now,
+      last_step: step || "policy_cancelled",
+      last_error: note || null,
+    })
+    .eq("id", jobId)
+    .eq("claimed_by", WORKER_ID);
+
+  if (error) throw error;
+}
+
 async function markFailedDeadletter(jobId, lastErrorCode) {
   const now = nowIso();
   const { error } = await sb
@@ -502,7 +518,7 @@ async function policyPreflight(job) {
   if (sidePermission === "FLAT_ONLY" || sizeTier === "TIER_0") {
     return {
       allow: false,
-      code: "policy_flat_only",
+      code: "symbol_not_allowed",
       symbol,
       policy,
     };
@@ -511,7 +527,7 @@ async function policyPreflight(job) {
   if (side === "LONG" && sidePermission !== "LONG_ONLY") {
     return {
       allow: false,
-      code: "policy_long_not_allowed",
+      code: "symbol_not_allowed",
       symbol,
       policy,
     };
@@ -520,7 +536,7 @@ async function policyPreflight(job) {
   if (side === "SHORT" && sidePermission !== "SHORT_ONLY") {
     return {
       allow: false,
-      code: "policy_short_not_allowed",
+      code: "symbol_not_allowed",
       symbol,
       policy,
     };
@@ -1022,15 +1038,15 @@ async function loop() {
       const preflight = await policyPreflight(claimed);
 
       if (!preflight.allow) {
-        await completeJobSkipped(
+        await cancelJobSkipped(
           claimed.id,
-          `policy_skipped_${preflight.code}`,
+          `policy_cancelled_${preflight.code}`,
           preflight.code
         );
 
         log({
           tag: TAG,
-          msg: "JOB_POLICY_SKIPPED",
+          msg: "JOB_POLICY_CANCELLED",
           ts: nowIso(),
           id: claimed.id,
           type: claimed.type,
