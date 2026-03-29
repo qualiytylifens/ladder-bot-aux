@@ -112,6 +112,10 @@ function isEntryAction(action) {
   const a = String(action || "").toLowerCase();
   return a === "buy" || a === "long" || a === "sell" || a === "short";
 }
+function isPaperLikeMode(mode) {
+  const m = String(mode || "").toLowerCase();
+  return m === "paper" || m === "paper_real_price" || m === "";
+}
 function msBackoff(baseMs, attempts) {
   const n = Math.max(1, Number(attempts || 0) + 1);
   return baseMs * n;
@@ -555,7 +559,7 @@ async function findOpenPaperTradeByPair(pair) {
   if (!pair) return null;
   const { data, error } = await sb
     .from("trades_prod")
-    .select("id,amount,status,metadata,created_at")
+    .select("id,amount,qty_base,entry_price,status,metadata,created_at")
     .eq("symbol", pair)
     .eq("status", "open")
     .order("created_at", { ascending: false })
@@ -568,7 +572,7 @@ async function findOpenPaperTradeByPair(pair) {
       r.metadata && (r.metadata.mode || r.metadata["mode"])
         ? String(r.metadata.mode || r.metadata["mode"])
         : "";
-    if (!mode || mode === "paper") return r;
+    if (isPaperLikeMode(mode)) return r;
   }
   return rows[0] || null;
 }
@@ -597,6 +601,31 @@ async function getTradeAmount(tradeId, tradeRowMaybe) {
   if (sum > 0) return sum;
 
   return 50;
+}
+
+async function getTradeQtyBase(tradeId, tradeRowMaybe) {
+  if (tradeRowMaybe && tradeRowMaybe.qty_base != null) {
+    const n = toNum(tradeRowMaybe.qty_base);
+    if (n && n > 0) return n;
+  }
+
+  const { data, error } = await sb
+    .from("trade_executions_prod")
+    .select("qty_base,execution_type")
+    .eq("trade_id", tradeId)
+    .eq("execution_type", "fill")
+    .order("executed_at", { ascending: false })
+    .limit(1000);
+
+  if (error) throw error;
+
+  let sum = 0;
+  for (const f of data || []) {
+    const n = toNum(f.qty_base);
+    if (n && n > 0) sum += n;
+  }
+
+  return sum > 0 ? sum : null;
 }
 
 async function hasAnyFill(tradeId) {
@@ -645,7 +674,7 @@ async function closeAlreadyWrittenForIntent(intentId) {
   return Boolean(data && data[0]);
 }
 
-async function writeCloseLedgerRow({ job, intentId, tradeId, pair, amount, price, priceSource, mode }) {
+async function writeCloseLedgerRow({ job, intentId, tradeId, pair, amount, qtyBase, price, priceSource, mode }) {
   const execId = randomUUID();
 
   const row = {
@@ -656,6 +685,7 @@ async function writeCloseLedgerRow({ job, intentId, tradeId, pair, amount, price
     executed_at: nowIso(),
     price: price,
     amount: amount,
+    qty_base: qtyBase,
     fee: 0,
     fee_currency: "USD",
     exchange: "paper",
@@ -726,7 +756,7 @@ async function ensureCloseLedgerForJob(job) {
     } else {
       const { data, error } = await sb
         .from("trades_prod")
-        .select("id,amount,metadata,status,created_at")
+        .select("id,amount,qty_base,entry_price,metadata,status,created_at")
         .eq("id", tradeId)
         .limit(1);
       if (error) throw error;
@@ -737,12 +767,18 @@ async function ensureCloseLedgerForJob(job) {
       return { ok: false, did: false, code: "close_ledger_no_trade_found", detail: `pair=${pair || "(null)"}` };
     }
 
+    const tradeMode =
+      tradeRow && tradeRow.metadata && tradeRow.metadata.mode
+        ? String(tradeRow.metadata.mode)
+        : mode;
+
     const hasFill = await hasAnyFill(tradeId);
-    if (!hasFill) {
+    if (!hasFill && !isPaperLikeMode(tradeMode)) {
       return { ok: false, did: false, code: "close_ledger_missing_fill", detail: `trade_id=${tradeId}` };
     }
 
     const amount = await getTradeAmount(tradeId, tradeRow);
+    const qtyBase = await getTradeQtyBase(tradeId, tradeRow);
     const priceMarks = await getPriceFromMarketMarks(pair);
     const priceLastFill = await getLastFillPrice(tradeId);
 
@@ -764,9 +800,10 @@ async function ensureCloseLedgerForJob(job) {
       tradeId,
       pair,
       amount,
+      qtyBase,
       price,
       priceSource,
-      mode,
+      mode: tradeMode,
     });
 
     log({
@@ -780,7 +817,9 @@ async function ensureCloseLedgerForJob(job) {
       pair,
       price,
       amount,
+      qty_base: qtyBase,
       price_source: priceSource,
+      trade_mode: tradeMode,
     });
 
     return { ok: true, did: true, code: "close_ledger_written", exec_id: execId };
@@ -831,7 +870,7 @@ async function resolveOpenPaperTradeIdByPair(pair) {
 
   for (const row of data || []) {
     const mode = row.metadata && row.metadata.mode ? String(row.metadata.mode) : null;
-    if (mode && mode !== "paper") continue;
+    if (!isPaperLikeMode(mode)) continue;
     return row.id;
   }
 
@@ -850,7 +889,7 @@ async function tradeIsOpen(tradeId) {
   if (!row) return null;
 
   const mode = row.metadata && row.metadata.mode ? String(row.metadata.mode) : null;
-  if (mode && mode !== "paper") return false;
+  if (!isPaperLikeMode(mode)) return false;
 
   return String(row.status || "").toLowerCase() === "open";
 }
