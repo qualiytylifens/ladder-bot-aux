@@ -116,6 +116,9 @@ function isPaperLikeMode(mode) {
   const m = String(mode || "").toLowerCase();
   return m === "paper" || m === "paper_real_price" || m === "";
 }
+function isLiveLikeMode(mode) {
+  return String(mode || "").toLowerCase() === "live";
+}
 function msBackoff(baseMs, attempts) {
   const n = Math.max(1, Number(attempts || 0) + 1);
   return baseMs * n;
@@ -433,10 +436,16 @@ async function executeViaWebhook(job) {
     return { ok: false, code: "missing_webhook_url", detail: "WORKER_WEBHOOK_URL not set" };
   }
 
+  const payload = {
+    ...(job.payload || {}),
+    intent_id: safeTrim(job.intent_id || job.payload?.intent_id || job.payload?.intentId),
+  };
+
   const body = {
     job_id: job.id,
     type: job.type,
-    payload: job.payload || {},
+    payload,
+    intent_id: payload.intent_id || null,
     worker_id: WORKER_ID,
     ts: nowIso(),
   };
@@ -455,11 +464,38 @@ async function executeViaWebhook(job) {
   );
 
   const text = await res.text().catch(() => "");
+  let parsed = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch (_) {}
+
   if (!res.ok) {
-    return { ok: false, code: `webhook_failed_http_${res.status}`, detail: text.slice(0, 500) };
+    return {
+      ok: false,
+      code: `webhook_failed_http_${res.status}`,
+      detail: text.slice(0, 500),
+      response: parsed,
+      http_status: res.status,
+    };
   }
 
-  return { ok: true, code: "ok", detail: text.slice(0, 500) };
+  if (parsed && parsed.ok === false) {
+    return {
+      ok: false,
+      code: parsed.error || "webhook_returned_ok_false",
+      detail: text.slice(0, 500),
+      response: parsed,
+      http_status: res.status,
+    };
+  }
+
+  return {
+    ok: true,
+    code: "ok",
+    detail: text.slice(0, 500),
+    response: parsed,
+    http_status: res.status,
+  };
 }
 
 // ---------- intent / policy helpers ----------
@@ -744,6 +780,10 @@ async function ensureCloseLedgerForJob(job) {
       safeTrim(payload.execution_mode) ||
       safeTrim(intent ? intent.execution_mode : "") ||
       "paper";
+
+    if (isLiveLikeMode(mode)) {
+      return { ok: true, did: false, code: "live_close_ledger_skipped" };
+    }
 
     let tradeId =
       safeTrim(payload.trade_id) ||
@@ -1114,6 +1154,20 @@ async function loop() {
       }
 
       if (result.ok) {
+        log({
+          tag: TAG,
+          msg: "WEBHOOK_OK",
+          ts: nowIso(),
+          id: claimed.id,
+          type: claimed.type,
+          intent_id: claimed.intent_id,
+          http_status: result.http_status || null,
+          response_ok: result.response?.ok ?? true,
+          response_error: result.response?.error || null,
+          order_id: result.response?.order_id || null,
+          action: result.response?.action || claimed.payload?.action || null,
+          mode: result.response?.mode || claimed.payload?.execution_mode || null,
+        });
         await touchHeartbeat(claimed.id, "close_ledger");
         const ledger = await ensureCloseLedgerForJob(claimed);
 
