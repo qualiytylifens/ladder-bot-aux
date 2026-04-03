@@ -11,7 +11,7 @@
  * Retry:
  *  - Uses execution_jobs.attempts (persisted in DB)
  *  - On failure: increments attempts, requeues with backoff by setting run_at in the future
- *  - When attempts reaches MAX_ATTEMPTS: marks failed with last_error=deadletter_max_attempts
+ *  - When attempts reaches MAX_ATTEMPTS: marks failed with the real last_error code
  *
  * Self-heal (optional):
  *  - Requeues deadlettered EXIT/CLOSE jobs only if trade is still OPEN (paper mode)
@@ -1079,7 +1079,7 @@ async function loop() {
           const attempts = Number(claimed.attempts || 0);
           const errCode = closeConfirm.code || "live_close_unconfirmed";
           if (attempts + 1 >= MAX_ATTEMPTS) {
-            await markFailedDeadletter(claimed.id, "deadletter_max_attempts");
+            await markFailedDeadletter(claimed.id, errCode);
             log({
               tag: TAG,
               msg: "JOB_DEADLETTERED_LIVE_CLOSE_PENDING",
@@ -1117,7 +1117,7 @@ async function loop() {
             const errCode = ledger.code || "close_ledger_failed";
 
             if (attempts + 1 >= MAX_ATTEMPTS) {
-              await markFailedDeadletter(claimed.id, "deadletter_max_attempts");
+              await markFailedDeadletter(claimed.id, errCode);
               log({
                 tag: TAG,
                 msg: "JOB_DEADLETTERED_CLOSE_LEDGER",
@@ -1161,7 +1161,7 @@ async function loop() {
       } else {
         const attempts = Number(claimed.attempts || 0);
         if (attempts + 1 >= MAX_ATTEMPTS) {
-          await markFailedDeadletter(claimed.id, "deadletter_max_attempts");
+          await markFailedDeadletter(claimed.id, result.code || "deadletter_max_attempts");
           log({
             tag: TAG,
             msg: "JOB_DEADLETTERED",
