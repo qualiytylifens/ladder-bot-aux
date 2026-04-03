@@ -22,7 +22,7 @@
  *  - SUPABASE_SERVICE_KEY
  *  - WORKER_ENABLED ("true"/"false")
  *  - WORKER_ID
- *  - TYPES (e.g. "execute_intent" or JSON '[\"execute_intent\"]')
+ *  - TYPES (e.g. "execute_intent" or JSON '["execute_intent"]')
  *  - POLL_MS (default 2000)
  *  - JOB_TIMEOUT_MS (default 60000)
  *  - JOB_HEARTBEAT_MS (default 15000)
@@ -236,6 +236,30 @@ function getLiveCloseConfirmationState(result, claimed) {
     closeValidation: closeValidation || null,
     confirmedOrderId: null,
   };
+}
+function isLiveCloseJob(job) {
+  const payload = job && job.payload && typeof job.payload === 'object' ? job.payload : {};
+  const action = String(payload.action || '').trim().toLowerCase();
+  const raw = payload.raw_signal && typeof payload.raw_signal === 'object' ? payload.raw_signal : {};
+  const executionMode =
+    String(
+      payload.execution_mode ||
+      payload.mode ||
+      raw.execution_mode ||
+      raw.mode ||
+      ''
+    ).trim().toLowerCase();
+
+  const closeLike =
+    action === 'close' ||
+    action === 'exit' ||
+    (action === 'sell' && (
+      raw._is_close_intent === true ||
+      String(raw.intent_kind || '').trim().toLowerCase() === 'close_trade' ||
+      !!(payload.trade_id || raw.trade_id)
+    ));
+
+  return executionMode === 'live' && closeLike;
 }
 
 // ---------- config ----------
@@ -1079,37 +1103,46 @@ async function loop() {
           continue;
         }
 
-        await touchHeartbeat(claimed.id, "close_ledger");
-        const ledger = await ensureCloseLedgerForJob({ job: claimed, result });
+        let ledger = { ok: true, did: false, code: "not_needed" };
 
-        if (!ledger.ok) {
-          const attempts = Number(claimed.attempts || 0);
-          const errCode = ledger.code || "close_ledger_failed";
-          if (attempts + 1 >= MAX_ATTEMPTS) {
-            await markFailedDeadletter(claimed.id, "deadletter_max_attempts");
-            log({
-              tag: TAG,
-              msg: "JOB_DEADLETTERED_CLOSE_LEDGER",
-              ts: nowIso(),
-              id: claimed.id,
-              type: claimed.type,
-              last_error: errCode,
-              detail: ledger.detail,
-            });
-          } else {
-            await requeueWithBackoff(claimed, errCode);
-            log({
-              tag: TAG,
-              msg: "JOB_CLOSE_LEDGER_FAILED_RETRYING",
-              ts: nowIso(),
-              id: claimed.id,
-              type: claimed.type,
-              last_error: errCode,
-              detail: ledger.detail,
-            });
+        if (isLiveCloseJob(claimed)) {
+          await touchHeartbeat(claimed.id, "live_close_skip_worker_ledger");
+          ledger = { ok: true, did: false, code: "live_close_journaled_by_bot" };
+        } else {
+          await touchHeartbeat(claimed.id, "close_ledger");
+          ledger = await ensureCloseLedgerForJob({ job: claimed, result });
+
+          if (!ledger.ok) {
+            const attempts = Number(claimed.attempts || 0);
+            const errCode = ledger.code || "close_ledger_failed";
+
+            if (attempts + 1 >= MAX_ATTEMPTS) {
+              await markFailedDeadletter(claimed.id, "deadletter_max_attempts");
+              log({
+                tag: TAG,
+                msg: "JOB_DEADLETTERED_CLOSE_LEDGER",
+                ts: nowIso(),
+                id: claimed.id,
+                type: claimed.type,
+                last_error: errCode,
+                detail: ledger.detail,
+              });
+            } else {
+              await requeueWithBackoff(claimed, errCode);
+              log({
+                tag: TAG,
+                msg: "JOB_CLOSE_LEDGER_FAILED_RETRYING",
+                ts: nowIso(),
+                id: claimed.id,
+                type: claimed.type,
+                last_error: errCode,
+                detail: ledger.detail,
+              });
+            }
+
+            await sleep(250);
+            continue;
           }
-          await sleep(250);
-          continue;
         }
 
         await touchHeartbeat(claimed.id, "finalizing");
