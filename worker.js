@@ -16,6 +16,11 @@
  *
  * Paper/legacy close rule:
  *  - Non-live close jobs may still use DB close-ledger fallback when enabled.
+ *
+ * Idempotency safety fix (FIXED_POLICY_V2):
+ *  - If ladder-bot returns HTTP 409 for a job that already produced a trade/execution
+ *    for the same intent_id, the worker treats that as already executed and completes
+ *    the job instead of deadlettering a false failure.
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -243,7 +248,7 @@ const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
 const hasApiSecret = Boolean(API_SECRET);
 
-log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V1' });
+log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V2' });
 
 log({
   tag: TAG,
@@ -534,6 +539,37 @@ async function policyPreflight(job) {
     log({ tag: TAG, msg: 'POLICY_PREFLIGHT_ERROR', ts: nowIso(), symbol, ...summarizeUnknownError(err) });
     return { allow: true, code: 'policy_lookup_failed_allow', symbol, policy: null };
   }
+}
+
+// ---------- idempotency helpers ----------
+async function findTradeForIntent(intentId) {
+  if (!intentId) return null;
+  const { data, error } = await sb
+    .from('trades_prod')
+    .select('id,status,signal_id,symbol,created_at,closed_at,metadata,close_validation,close_order_id')
+    .eq('signal_id', intentId)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return data && data[0] ? data[0] : null;
+}
+async function findExecutionForIntent(intentId) {
+  if (!intentId) return null;
+  const { data, error } = await sb
+    .from('trade_executions_prod')
+    .select('id,trade_id,intent_id,execution_type,executed_at,created_at')
+    .eq('intent_id', intentId)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return data && data[0] ? data[0] : null;
+}
+async function detectAlreadyExecutedForIntent(intentId) {
+  const trade = await findTradeForIntent(intentId).catch(() => null);
+  if (trade) return { alreadyExecuted: true, source: 'trades_prod', trade };
+  const execution = await findExecutionForIntent(intentId).catch(() => null);
+  if (execution) return { alreadyExecuted: true, source: 'trade_executions_prod', execution };
+  return { alreadyExecuted: false, source: null };
 }
 
 // ---------- close ledger helpers ----------
@@ -1000,6 +1036,31 @@ async function loop() {
           live_close_code: closeConfirm.liveClose ? closeConfirm.code : null,
         });
       } else {
+        if (result.http_status === 409) {
+          const intentId = safeTrim(claimed.intent_id || claimed.payload?.intent_id || claimed.payload?.intentId);
+          const dedupe = await detectAlreadyExecutedForIntent(intentId).catch(() => ({ alreadyExecuted: false, source: null }));
+          if (dedupe.alreadyExecuted) {
+            await touchHeartbeat(claimed.id, 'already_executed_conflict');
+            await completeJob(claimed.id);
+            log({
+              tag: TAG,
+              msg: 'JOB_COMPLETED_ALREADY_EXECUTED_CONFLICT',
+              ts: nowIso(),
+              id: claimed.id,
+              type: claimed.type,
+              intent_id: intentId || null,
+              conflict_code: result.code,
+              conflict_detail: result.detail || null,
+              dedupe_source: dedupe.source || null,
+              trade_id: dedupe.trade?.id || dedupe.execution?.trade_id || null,
+              trade_status: dedupe.trade?.status || null,
+              close_validation: dedupe.trade?.close_validation || null,
+            });
+            await sleep(250);
+            continue;
+          }
+        }
+
         const attempts = Number(claimed.attempts || 0);
         if (attempts + 1 >= MAX_ATTEMPTS) {
           await markFailedDeadletter(claimed.id, result.code);
