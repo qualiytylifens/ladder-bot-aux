@@ -243,6 +243,8 @@ const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
 const hasApiSecret = Boolean(API_SECRET);
 
+log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V1' });
+
 log({
   tag: TAG,
   msg: 'WORKER_STARTED',
@@ -858,6 +860,16 @@ async function loop() {
 
       await touchHeartbeat(claimed.id, 'policy_preflight');
       const preflight = await policyPreflight(claimed);
+      log({
+        tag: TAG,
+        msg: 'policy_preflight',
+        ts: nowIso(),
+        id: claimed.id,
+        intent_id: claimed.intent_id,
+        allow: preflight.allow,
+        code: preflight.code,
+        symbol: preflight.symbol || null,
+      });
       if (!preflight.allow) {
         await cancelJobSkipped(claimed.id, `policy_cancelled_${preflight.code}`, preflight.code);
         log({
@@ -880,6 +892,7 @@ async function loop() {
       }
 
       await touchHeartbeat(claimed.id, 'webhook_dispatch');
+      log({ tag: TAG, msg: 'STEP: webhook_dispatch', ts: nowIso(), id: claimed.id, intent_id: claimed.intent_id });
       const stopHeartbeat = startHeartbeat(claimed.id, JOB_HEARTBEAT_MS);
       let result;
       try {
