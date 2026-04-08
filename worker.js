@@ -658,31 +658,28 @@ async function openPosition(productId, side, quoteAmount, stopLossPercent = 5, t
   const normalizedProductId = normalizeCoinbaseSymbol(productId);
   const baseCoin = extractBaseCoin(normalizedProductId);
 
-  console.log(`
-[COINBASE] OPENING POSITION ${side} ${normalizedProductId} with quote ${quoteAmount}`);
+  console.log(`\n[COINBASE] OPENING POSITION ${side} ${normalizedProductId} with quote ${quoteAmount}`);
 
-  const balance = await getSpendableUsdBalance();
-  if (!balance || balance.success === false || balance.available == null) {
-    return {
-      success: false,
-      error: `Balance lookup failed: ${balance?.error || 'unknown_error'}`,
-      details: balance?.details || null,
-      data: balance?.data || null
-    };
-  }
+  // Advisory only: do not hard-block entry on balance lookup failure.
+  // Let Coinbase reject the order if funding is actually insufficient.
+  const balance = await getSpendableUsdBalance().catch((err) => ({
+    success: false,
+    error: err?.message || String(err)
+  }));
 
-  console.log('[COINBASE] Spendable balance check', {
-    selected_currency: balance.currency,
-    available: balance.available,
-    requested_quote_amount: quoteAmount,
-    productId: normalizedProductId
-  });
-
-  if (!balance.available || balance.available < quoteAmount) {
-    return {
-      success: false,
-      error: `Insufficient live USD/USDC balance. Currency: ${balance.currency || 'UNKNOWN'}. Available: $${balance.available?.toFixed(2) || 0}. Requested: $${Number(quoteAmount || 0).toFixed(2)}`
-    };
+  if (balance && balance.success === false) {
+    console.warn('[COINBASE] Advisory balance lookup failed, proceeding to Coinbase order placement', {
+      productId: normalizedProductId,
+      error: balance.error || null,
+      details: balance.details || null
+    });
+  } else if (balance && balance.available != null) {
+    console.log('[COINBASE] Spendable balance advisory', {
+      selected_currency: balance.currency,
+      available: balance.available,
+      requested_quote_amount: quoteAmount,
+      productId: normalizedProductId
+    });
   }
 
   const priceData = await getBestBidAsk(normalizedProductId);
