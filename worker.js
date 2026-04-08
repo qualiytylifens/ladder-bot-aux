@@ -592,10 +592,41 @@ function normalizeCoinbaseSymbol(symbol) {
   const raw = String(symbol || '').trim().toUpperCase();
   if (!raw) return null;
 
-  if (raw.endsWith('C-USDC')) return raw.replace('C-USDC', '-USDC');
-  if (raw.endsWith('-USDC')) return raw;
-  if (raw.endsWith('USDC') && !raw.includes('-')) return raw.replace('USDC', '-USDC');
+  const directMap = {
+    'ETHC-USDC': 'ETH-USD',
+    'BTCC-USDC': 'BTC-USD',
+    'DOGEC-USDC': 'DOGE-USD',
+    'SOLC-USDC': 'SOL-USD',
+    'XRPC-USDC': 'XRP-USD',
+    'ETHCUSD': 'ETH-USD',
+    'BTCCUSD': 'BTC-USD',
+    'DOGECUSD': 'DOGE-USD',
+    'SOLCUSD': 'SOL-USD',
+    'XRPCUSD': 'XRP-USD'
+  };
+
+  if (directMap[raw]) return directMap[raw];
+
+  if (raw.endsWith('C-USDC')) {
+    const base = raw.replace('C-USDC', '');
+    return `${base}-USD`;
+  }
+
+  if (raw.endsWith('-USDC')) {
+    const base = raw.replace('-USDC', '');
+    return `${base}-USD`;
+  }
+
+  if (raw.endsWith('USDC') && !raw.includes('-')) {
+    const base = raw.replace('USDC', '');
+    return `${base}-USD`;
+  }
+
   if (raw.endsWith('-USD')) return raw;
+  if (raw.endsWith('USD') && !raw.includes('-')) {
+    const base = raw.replace('USD', '');
+    return `${base}-USD`;
+  }
 
   return raw;
 }
