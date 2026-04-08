@@ -84,8 +84,7 @@ function normalizePrivateKey(rawKey) {
     key = key.slice(1, -1).trim();
   }
 
-  key = key.replace(/\n/g, '
-');
+  key = key.replace(/\\n/g, '\n');
   return key;
 }
 
