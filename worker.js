@@ -1530,6 +1530,152 @@ async function detectAlreadyExecutedForIntent(intentId) {
   return { alreadyExecuted: false, source: null };
 }
 
+async function ensureLiveEntryJournalForJob({ job, result }) {
+  try {
+    const payload = job && job.payload && typeof job.payload === 'object' ? job.payload : {};
+    const raw = payload.raw_signal && typeof payload.raw_signal === 'object' ? payload.raw_signal : {};
+    const action = safeTrim(payload.action || raw.action).toLowerCase();
+    const mode = safeTrim(payload.execution_mode || payload.mode || raw.execution_mode || raw.mode).toLowerCase();
+
+    if (action !== 'buy' || mode !== 'live') {
+      return { ok: true, code: 'not_live_entry' };
+    }
+
+    const intentId = safeTrim(job.intent_id || payload.intent_id || payload.intentId);
+    if (!intentId) {
+      return { ok: false, code: 'missing_intent_id' };
+    }
+
+    const existing = await findTradeForIntent(intentId).catch(() => null);
+    if (existing) {
+      return { ok: true, code: 'trade_exists', trade_id: existing.id };
+    }
+
+    const tradeId = randomUUID();
+    const fillId = randomUUID();
+
+    const symbol =
+      safeTrim(payload.symbol) ||
+      safeTrim(payload.pair) ||
+      safeTrim(raw.symbol) ||
+      safeTrim(raw.pair);
+
+    const entryPrice = toNum(
+      result?.response?.fill_price ??
+      payload.price ??
+      raw.price ??
+      raw._computed_price ??
+      raw.mark_price ??
+      raw.entry_price
+    );
+
+    const qtyBase = toNum(
+      result?.response?.fill_qty ??
+      payload.qty_base ??
+      payload.base_size ??
+      raw.qty_base ??
+      raw._computed_qty
+    );
+
+    const amount = toNum(
+      payload.amount ??
+      raw.amount ??
+      raw._computed_amount_usd ??
+      raw.amount_usd ??
+      50
+    );
+
+    const orderId = safeTrim(
+      result?.response?.broker_order_id ||
+      result?.response?.order_id ||
+      result?.response?.client_order_id
+    ) || null;
+
+    const tradeRow = {
+      id: tradeId,
+      signal_id: intentId,
+      symbol,
+      status: 'open',
+      created_at: nowIso(),
+      entry_price: entryPrice,
+      amount,
+      qty_base: qtyBase,
+      metadata: {
+        mode: 'live',
+        intent_id: intentId,
+        source: 'worker_live_entry_journal',
+        order_id: orderId,
+        worker_id: WORKER_ID
+      }
+    };
+
+    const fillRow = {
+      id: fillId,
+      trade_id: tradeId,
+      intent_id: intentId,
+      execution_type: 'fill',
+      executed_at: nowIso(),
+      price: entryPrice,
+      amount,
+      qty_base: qtyBase,
+      fee: 0,
+      fee_currency: 'USD',
+      exchange: 'coinbase',
+      metadata: {
+        mode: 'live',
+        source: 'worker_live_entry_journal',
+        order_id: orderId,
+        worker_id: WORKER_ID
+      },
+      created_at: nowIso()
+    };
+
+    const tradeInsert = await sb.from('trades_prod').insert(tradeRow);
+    if (tradeInsert.error) {
+      const afterTrade = await findTradeForIntent(intentId).catch(() => null);
+      if (afterTrade) {
+        return { ok: true, code: 'trade_exists_after_insert', trade_id: afterTrade.id };
+      }
+      return {
+        ok: false,
+        code: 'live_entry_trade_insert_failed',
+        detail: tradeInsert.error.message || String(tradeInsert.error)
+      };
+    }
+
+    const fillInsert = await sb.from('trade_executions_prod').insert(fillRow);
+    if (fillInsert.error) {
+      return {
+        ok: false,
+        code: 'live_entry_fill_insert_failed',
+        detail: fillInsert.error.message || String(fillInsert.error)
+      };
+    }
+
+    log({
+      tag: TAG,
+      msg: 'LIVE_ENTRY_JOURNALED',
+      ts: nowIso(),
+      job_id: job.id,
+      intent_id: intentId,
+      trade_id: tradeId,
+      order_id: orderId,
+      symbol,
+      entry_price: entryPrice,
+      qty_base: qtyBase,
+      amount
+    });
+
+    return { ok: true, code: 'live_entry_journaled', trade_id: tradeId };
+  } catch (err) {
+    return {
+      ok: false,
+      code: 'live_entry_journal_exception',
+      detail: err && err.message ? err.message : String(err)
+    };
+  }
+}
+
 // ---------- close ledger helpers ----------
 async function closeAlreadyWrittenForIntent(intentId) {
   const { data, error } = await sb
@@ -1947,16 +2093,27 @@ async function loop() {
           await touchHeartbeat(claimed.id, 'live_close_skip_worker_ledger');
           ledger = { ok: true, did: false, code: 'live_close_journaled_by_bot' };
         } else {
-          await touchHeartbeat(claimed.id, 'close_ledger');
-          ledger = await ensureCloseLedgerForJob({ job: claimed });
+          const payload = claimed.payload || {};
+          const raw = payload.raw_signal && typeof payload.raw_signal === 'object' ? payload.raw_signal : {};
+          const action = safeTrim(payload.action || raw.action).toLowerCase();
+          const mode = safeTrim(payload.execution_mode || payload.mode || raw.execution_mode || raw.mode).toLowerCase();
+
+          if (action === 'buy' && mode === 'live') {
+            await touchHeartbeat(claimed.id, 'live_entry_journal');
+            ledger = await ensureLiveEntryJournalForJob({ job: claimed, result });
+          } else {
+            await touchHeartbeat(claimed.id, 'close_ledger');
+            ledger = await ensureCloseLedgerForJob({ job: claimed });
+          }
+
           if (!ledger.ok) {
             const attempts = Number(claimed.attempts || 0);
-            const errCode = ledger.code || 'close_ledger_failed';
+            const errCode = ledger.code || 'journal_failed';
             if (attempts + 1 >= MAX_ATTEMPTS) {
               await markFailedDeadletter(claimed.id, errCode);
               log({
                 tag: TAG,
-                msg: 'JOB_DEADLETTERED_CLOSE_LEDGER',
+                msg: 'JOB_DEADLETTERED_JOURNAL',
                 ts: nowIso(),
                 id: claimed.id,
                 type: claimed.type,
@@ -1967,7 +2124,7 @@ async function loop() {
               await requeueWithBackoff(claimed, errCode);
               log({
                 tag: TAG,
-                msg: 'JOB_CLOSE_LEDGER_FAILED_RETRYING',
+                msg: 'JOB_JOURNAL_FAILED_RETRYING',
                 ts: nowIso(),
                 id: claimed.id,
                 type: claimed.type,
