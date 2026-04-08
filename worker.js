@@ -6,25 +6,26 @@
  *  - claim execution_jobs(status='queued') where:
  *      - claimed_by is null
  *      - run_at is null OR run_at <= now()
- *  - POST to WORKER_WEBHOOK_URL (ladder-bot /webhook/worker) with API_SECRET auth
+ *  - execute directly against Coinbase layer (no internal webhook relay)
  *
  * Critical live-close rule:
  *  - LIVE close jobs MUST NEVER write fallback/paper close ledger rows.
- *  - A live close job is only completed when ladder-bot confirms the exchange close.
+ *  - A live close job is only completed when execution confirms the exchange close.
  *  - If confirmation is missing, the job is retried/deadlettered with
  *    live_close_unconfirmed or live_close_pending_confirmation.
  *
  * Paper/legacy close rule:
  *  - Non-live close jobs may still use DB close-ledger fallback when enabled.
  *
- * Idempotency safety fix (FIXED_POLICY_V2):
- *  - If ladder-bot returns HTTP 409 for a job that already produced a trade/execution
+ * Idempotency safety fix (FIXED_POLICY_V3_DIRECT):
+ *  - If direct execution already produced a trade/execution
  *    for the same intent_id, the worker treats that as already executed and completes
  *    the job instead of deadlettering a false failure.
  */
 
 const { createClient } = require('@supabase/supabase-js');
 const { randomUUID } = require('crypto');
+const { executeTrade } = require('./coinbase_execution');
 
 function nowIso() {
   return new Date().toISOString();
@@ -47,9 +48,6 @@ function envInt(name, fallback) {
 }
 function safeTrim(v) {
   return String(v || '').trim();
-}
-function normalizeWebhookUrl(u) {
-  return safeTrim(u);
 }
 function toNum(v) {
   if (v === null || v === undefined || v === '') return null;
@@ -117,15 +115,6 @@ function summarizeUnknownError(err) {
     error_hint: err && err.hint ? err.hint : null,
     error_stack: err && err.stack ? err.stack : null,
   };
-}
-async function fetchWithTimeout(url, opts, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 function getLiveCloseConfirmationState(result, claimed) {
@@ -228,7 +217,6 @@ const WORKER_ENABLED = envBool('WORKER_ENABLED', true);
 const WORKER_ID = process.env.WORKER_ID || 'ladder-worker-1';
 const TYPES = parseTypes(process.env.TYPES || process.env.WORKER_TYPES || 'execute_intent');
 const POLL_MS = envInt('POLL_MS', 2000);
-const JOB_TIMEOUT_MS = envInt('JOB_TIMEOUT_MS', 60000);
 const JOB_HEARTBEAT_MS = envInt('JOB_HEARTBEAT_MS', 15000);
 const MAX_ATTEMPTS = envInt('MAX_ATTEMPTS', 3);
 const RETRY_BACKOFF_MS = envInt('RETRY_BACKOFF_MS', 5000);
@@ -239,16 +227,10 @@ const CLOSE_LEDGER_ASSUME_BOT_WRITES = envBool('CLOSE_LEDGER_ASSUME_BOT_WRITES',
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
-const WORKER_WEBHOOK_URL = normalizeWebhookUrl(
-  process.env.WORKER_WEBHOOK_URL || process.env.WEBHOOK_URL || process.env.WORKER_WEBHOOK || ''
-);
-const API_SECRET = safeTrim(process.env.API_SECRET || '');
 
 const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
-const hasWebhook = Boolean(WORKER_WEBHOOK_URL);
-const hasApiSecret = Boolean(API_SECRET);
 
-log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V2' });
+log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V3_DIRECT' });
 
 log({
   tag: TAG,
@@ -258,7 +240,6 @@ log({
   WORKER_ID,
   TYPES,
   POLL_MS,
-  JOB_TIMEOUT_MS,
   JOB_HEARTBEAT_MS,
   MAX_ATTEMPTS,
   RETRY_BACKOFF_MS,
@@ -267,9 +248,7 @@ log({
   CLOSE_LEDGER_ENABLED,
   CLOSE_LEDGER_ASSUME_BOT_WRITES,
   hasSupabase,
-  hasWebhook,
-  hasApiSecret,
-  webhook_url_prefix: WORKER_WEBHOOK_URL ? WORKER_WEBHOOK_URL.slice(0, 80) : null,
+  direct_execution: true,
 });
 
 if (!WORKER_ENABLED) {
@@ -421,62 +400,79 @@ async function claimJob(jobId) {
   return data && data[0] ? data[0] : null;
 }
 
-// ---------- webhook ----------
-async function executeViaWebhook(job) {
-  if (!hasWebhook) {
-    return { ok: false, code: 'missing_webhook_url', detail: 'WORKER_WEBHOOK_URL not set' };
-  }
-
-  const payload = {
-    ...(job.payload || {}),
-    intent_id: safeTrim(job.intent_id || job.payload?.intent_id || job.payload?.intentId),
-  };
-  const body = {
-    job_id: job.id,
-    type: job.type,
-    payload,
-    intent_id: payload.intent_id || null,
-    worker_id: WORKER_ID,
-    ts: nowIso(),
-  };
-  const headers = { 'content-type': 'application/json' };
-  if (hasApiSecret) {
-    headers['x-api-secret'] = API_SECRET;
-    headers['x-api-key'] = API_SECRET;
-    headers.authorization = `Bearer ${API_SECRET}`;
-  }
-
-  const res = await fetchWithTimeout(
-    WORKER_WEBHOOK_URL,
-    { method: 'POST', headers, body: JSON.stringify(body) },
-    JOB_TIMEOUT_MS,
-  );
-
-  const text = await res.text().catch(() => '');
-  let parsed = null;
+// ---------- direct execution ----------
+async function executeDirect(job) {
   try {
-    parsed = text ? JSON.parse(text) : null;
-  } catch (_) {}
+    const payload = job && job.payload && typeof job.payload === 'object' ? job.payload : {};
+    const raw = payload.raw_signal && typeof payload.raw_signal === 'object' ? payload.raw_signal : {};
 
-  if (!res.ok) {
+    const action = String(payload.action || raw.action || '').trim().toUpperCase();
+    const symbol = String(payload.symbol || payload.pair || raw.symbol || raw.pair || '').trim().toUpperCase();
+
+    if (!action) {
+      return { ok: false, code: 'missing_action', detail: 'job payload missing action' };
+    }
+    if (!symbol) {
+      return { ok: false, code: 'missing_symbol', detail: 'job payload missing symbol' };
+    }
+
+    let signalSide = action;
+    if (action === 'CLOSE' || action === 'EXIT') {
+      signalSide = 'SELL';
+    }
+
+    const signal = {
+      symbol,
+      side: signalSide,
+      price: payload.price ?? raw.price ?? raw.mark_price ?? raw.entry_price ?? null,
+      amount: payload.amount ?? raw.amount ?? raw._computed_amount_usd ?? raw.amount_usd ?? 50,
+      qty_base: payload.qty_base ?? raw.qty_base ?? raw._computed_qty ?? null,
+      mode: payload.execution_mode || payload.mode || raw.execution_mode || raw.mode || 'live',
+      trade_id: payload.trade_id || raw.trade_id || null,
+      reason: payload.reason || raw.reason || raw.exit_reason || null
+    };
+
+    const exec = await executeTrade(signal);
+
+    if (!exec || exec.success !== true) {
+      return {
+        ok: false,
+        code: exec?.error || 'direct_execution_failed',
+        detail: JSON.stringify(exec || {}).slice(0, 500),
+        response: exec || null
+      };
+    }
+
+    return {
+      ok: true,
+      code: 'ok',
+      http_status: 200,
+      response: {
+        ok: true,
+        mode: 'live',
+        action: signalSide,
+        order_id: exec.orderId || null,
+        broker_order_id: exec.brokerOrderId || null,
+        client_order_id: exec.clientOrderId || null,
+        fill_qty: exec.fillQty ?? null,
+        fill_price: exec.fillPrice ?? exec.entryPrice ?? exec.exitPrice ?? null,
+        exchange: exec.exchange || 'coinbase',
+        pending_confirmation: exec.pendingFill === true,
+        close_validation:
+          signalSide === 'SELL'
+            ? (exec.pendingFill === true ? 'client_order_only_fill_recorded' : 'broker_order_confirmed')
+            : null,
+        detail: exec.detail || null
+      },
+      detail: JSON.stringify(exec || {}).slice(0, 500)
+    };
+  } catch (err) {
     return {
       ok: false,
-      code: `webhook_failed_http_${res.status}`,
-      detail: text.slice(0, 500),
-      response: parsed,
-      http_status: res.status,
+      code: 'direct_execution_exception',
+      detail: err?.message || String(err)
     };
   }
-  if (parsed && parsed.ok === false) {
-    return {
-      ok: false,
-      code: parsed.error || parsed.reason || 'webhook_returned_ok_false',
-      detail: text.slice(0, 500),
-      response: parsed,
-      http_status: res.status,
-    };
-  }
-  return { ok: true, code: 'ok', detail: text.slice(0, 500), response: parsed, http_status: res.status };
 }
 
 // ---------- policy ----------
@@ -927,12 +923,12 @@ async function loop() {
         continue;
       }
 
-      await touchHeartbeat(claimed.id, 'webhook_dispatch');
-      log({ tag: TAG, msg: 'STEP: webhook_dispatch', ts: nowIso(), id: claimed.id, intent_id: claimed.intent_id });
+      await touchHeartbeat(claimed.id, 'direct_execution');
+      log({ tag: TAG, msg: 'STEP: direct_execution', ts: nowIso(), id: claimed.id, intent_id: claimed.intent_id });
       const stopHeartbeat = startHeartbeat(claimed.id, JOB_HEARTBEAT_MS);
       let result;
       try {
-        result = await executeViaWebhook(claimed);
+        result = await executeDirect(claimed);
       } finally {
         stopHeartbeat();
       }
@@ -941,12 +937,11 @@ async function loop() {
         const closeConfirm = getLiveCloseConfirmationState(result, claimed);
         log({
           tag: TAG,
-          msg: 'WEBHOOK_OK',
+          msg: 'DIRECT_EXECUTION_OK',
           ts: nowIso(),
           id: claimed.id,
           type: claimed.type,
           intent_id: claimed.intent_id,
-          http_status: result.http_status || null,
           response_ok: result.response?.ok ?? true,
           response_error: result.response?.error || null,
           order_id: result.response?.order_id || null,
@@ -1036,29 +1031,27 @@ async function loop() {
           live_close_code: closeConfirm.liveClose ? closeConfirm.code : null,
         });
       } else {
-        if (result.http_status === 409) {
-          const intentId = safeTrim(claimed.intent_id || claimed.payload?.intent_id || claimed.payload?.intentId);
-          const dedupe = await detectAlreadyExecutedForIntent(intentId).catch(() => ({ alreadyExecuted: false, source: null }));
-          if (dedupe.alreadyExecuted) {
-            await touchHeartbeat(claimed.id, 'already_executed_conflict');
-            await completeJob(claimed.id);
-            log({
-              tag: TAG,
-              msg: 'JOB_COMPLETED_ALREADY_EXECUTED_CONFLICT',
-              ts: nowIso(),
-              id: claimed.id,
-              type: claimed.type,
-              intent_id: intentId || null,
-              conflict_code: result.code,
-              conflict_detail: result.detail || null,
-              dedupe_source: dedupe.source || null,
-              trade_id: dedupe.trade?.id || dedupe.execution?.trade_id || null,
-              trade_status: dedupe.trade?.status || null,
-              close_validation: dedupe.trade?.close_validation || null,
-            });
-            await sleep(250);
-            continue;
-          }
+        const intentId = safeTrim(claimed.intent_id || claimed.payload?.intent_id || claimed.payload?.intentId);
+        const dedupe = await detectAlreadyExecutedForIntent(intentId).catch(() => ({ alreadyExecuted: false, source: null }));
+        if (dedupe.alreadyExecuted) {
+          await touchHeartbeat(claimed.id, 'already_executed_conflict');
+          await completeJob(claimed.id);
+          log({
+            tag: TAG,
+            msg: 'JOB_COMPLETED_ALREADY_EXECUTED_CONFLICT',
+            ts: nowIso(),
+            id: claimed.id,
+            type: claimed.type,
+            intent_id: intentId || null,
+            conflict_code: result.code,
+            conflict_detail: result.detail || null,
+            dedupe_source: dedupe.source || null,
+            trade_id: dedupe.trade?.id || dedupe.execution?.trade_id || null,
+            trade_status: dedupe.trade?.status || null,
+            close_validation: dedupe.trade?.close_validation || null,
+          });
+          await sleep(250);
+          continue;
         }
 
         const attempts = Number(claimed.attempts || 0);
@@ -1077,7 +1070,7 @@ async function loop() {
           await requeueWithBackoff(claimed, result.code);
           log({
             tag: TAG,
-            msg: 'JOB_WEBHOOK_FAILED_RETRYING',
+            msg: 'JOB_DIRECT_EXECUTION_FAILED_RETRYING',
             ts: nowIso(),
             id: claimed.id,
             type: claimed.type,
