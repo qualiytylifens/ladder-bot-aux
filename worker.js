@@ -17,15 +17,60 @@
  * Paper/legacy close rule:
  *  - Non-live close jobs may still use DB close-ledger fallback when enabled.
  *
- * Idempotency safety fix (FIXED_POLICY_V3_DIRECT):
+ * Idempotency safety fix (FIXED_POLICY_V3_DIRECT_RESOLVER):
  *  - If direct execution already produced a trade/execution
  *    for the same intent_id, the worker treats that as already executed and completes
  *    the job instead of deadlettering a false failure.
+ *  - Coinbase execution module is loaded through a safe resolver so Railway path/name
+ *    mismatches are surfaced clearly in logs.
  */
 
 const { createClient } = require('@supabase/supabase-js');
 const { randomUUID } = require('crypto');
-const { executeTrade } = require('./coinbase_execution');
+const fs = require('fs');
+const path = require('path');
+
+function loadCoinbaseExecution() {
+  const candidates = [
+    './coinbase_execution.js',
+    './coinbase_execution',
+    './coinbase-execution.js',
+    './coinbase-execution',
+    './lib/coinbase_execution.js',
+    './lib/coinbase_execution',
+    './lib/coinbase-execution.js',
+    './lib/coinbase-execution',
+    '/app/coinbase_execution.js',
+    '/app/coinbase_execution',
+    '/app/coinbase-execution.js',
+    '/app/coinbase-execution'
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const resolved = path.isAbsolute(candidate)
+        ? candidate
+        : path.resolve(__dirname, candidate);
+
+      if (!fs.existsSync(resolved)) continue;
+
+      const mod = require(resolved);
+      if (mod && typeof mod.executeTrade === 'function') {
+        console.log(`[WORKER] Loaded Coinbase execution module from: ${resolved}`);
+        return mod;
+      }
+    } catch (err) {
+      console.error(`[WORKER] Coinbase module candidate failed: ${candidate} :: ${err.message}`);
+    }
+  }
+
+  const files = fs.readdirSync(__dirname);
+  throw new Error(
+    `[WORKER] Coinbase execution module not found. __dirname=${__dirname}. Files in dir: ${files.join(', ')}`
+  );
+}
+
+const { executeTrade } = loadCoinbaseExecution();
 
 function nowIso() {
   return new Date().toISOString();
@@ -230,7 +275,7 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 
 const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 
-log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V3_DIRECT' });
+log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V3_DIRECT_RESOLVER' });
 
 log({
   tag: TAG,
