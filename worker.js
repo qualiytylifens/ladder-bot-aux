@@ -27,50 +27,925 @@
 
 const { createClient } = require('@supabase/supabase-js');
 const { randomUUID } = require('crypto');
-const fs = require('fs');
-const path = require('path');
 
-function loadCoinbaseExecution() {
-  const candidates = [
-    './coinbase_execution.js',
-    './coinbase_execution',
-    './coinbase-execution.js',
-    './coinbase-execution',
-    './lib/coinbase_execution.js',
-    './lib/coinbase_execution',
-    './lib/coinbase-execution.js',
-    './lib/coinbase-execution',
-    '/app/coinbase_execution.js',
-    '/app/coinbase_execution',
-    '/app/coinbase-execution.js',
-    '/app/coinbase-execution'
-  ];
+const { executeTrade } = (() => {
+/**
+ * ============================================
+ * COINBASE EXECUTION LAYER v2.7
+ * Advanced Trade JWT auth (ECDSA / ES256)
+ * USDC-primary product and balance handling
+ * Real trades. Real money. No simulation.
+ *
+ * v2.7 fixes:
+ * - Treat Coinbase order acceptance as success even if immediate order lookup is unavailable.
+ * - Preserve BOTH brokerOrderId and clientOrderId.
+ * - orderId now always returns a durable value:
+ *     brokerOrderId || clientOrderId
+ * - SELL path skips hard failure when broker order id is not immediately available.
+ * - BUY path does the same for entry execution.
+ * - Added base-balance clamp on SELL to reduce size/precision rejection risk.
+ * - Added safer fallback fill fields for downstream journaling/receipts.
+ *
+ * v2.8 fix:
+ * - LIVE SELL path now uses Coinbase balance truth instead of requested trade size.
+ * ============================================
+ */
 
-  for (const candidate of candidates) {
-    try {
-      const resolved = path.isAbsolute(candidate)
-        ? candidate
-        : path.resolve(__dirname, candidate);
+const crypto = require('crypto');
 
-      if (!fs.existsSync(resolved)) continue;
+const COINBASE_CONFIG = {
+  baseUrl: 'https://api.coinbase.com',
+  apiVersion: '2024-01-01',
+  keyId: process.env.COINBASE_KEY_ID || '',
+  privateKey: process.env.COINBASE_PRIVATE_KEY || '',
+  host: 'api.coinbase.com'
+};
 
-      const mod = require(resolved);
-      if (mod && typeof mod.executeTrade === 'function') {
-        console.log(`[WORKER] Loaded Coinbase execution module from: ${resolved}`);
-        return mod;
-      }
-    } catch (err) {
-      console.error(`[WORKER] Coinbase module candidate failed: ${candidate} :: ${err.message}`);
-    }
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function base64UrlEncode(input) {
+  const buffer = Buffer.isBuffer(input) ? input : Buffer.from(String(input));
+  return buffer
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function normalizePrivateKey(rawKey) {
+  let key = String(rawKey || '').trim();
+
+  if (
+    (key.startsWith('"') && key.endsWith('"')) ||
+    (key.startsWith("'") && key.endsWith("'"))
+  ) {
+    key = key.slice(1, -1).trim();
   }
 
-  const files = fs.readdirSync(__dirname);
-  throw new Error(
-    `[WORKER] Coinbase execution module not found. __dirname=${__dirname}. Files in dir: ${files.join(', ')}`
+  key = key.replace(/\n/g, '
+');
+  return key;
+}
+
+function roundBaseSize(value, decimals = 8) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  const factor = Math.pow(10, decimals);
+  return Math.floor(n * factor) / factor;
+}
+
+// Correct JWT assembly
+function generateJWT(method, path) {
+  const keyId = String(COINBASE_CONFIG.keyId || '').trim();
+  const privateKey = normalizePrivateKey(COINBASE_CONFIG.privateKey);
+
+  if (!keyId) throw new Error('Coinbase API key id not configured');
+  if (!privateKey) throw new Error('Coinbase private key not configured');
+
+  const now = Math.floor(Date.now() / 1000);
+  const uri = `${String(method || 'GET').toUpperCase()} ${COINBASE_CONFIG.host}${path}`;
+
+  const header = {
+    alg: 'ES256',
+    typ: 'JWT',
+    kid: keyId,
+    nonce: crypto.randomBytes(16).toString('hex')
+  };
+
+  const payload = {
+    iss: 'cdp',
+    sub: keyId,
+    nbf: now,
+    iat: now,
+    exp: now + 120,
+    uri
+  };
+
+  const encodedHeader = base64UrlEncode(JSON.stringify(header));
+  const encodedPayload = base64UrlEncode(JSON.stringify(payload));
+  const signingInput = `${encodedHeader}.${encodedPayload}`;
+
+  const signature = crypto.sign('sha256', Buffer.from(signingInput), {
+    key: privateKey,
+    dsaEncoding: 'ieee-p1363'
+  });
+
+  const encodedSignature = base64UrlEncode(signature);
+  return `${encodedHeader}.${encodedPayload}.${encodedSignature}`;
+}
+
+async function coinbaseRequest(method, path, body = null) {
+  const apiKey = String(COINBASE_CONFIG.keyId || '').trim();
+
+  if (!apiKey || !COINBASE_CONFIG.privateKey) {
+    return { success: false, error: 'Coinbase API credentials not configured' };
+  }
+
+  const url = `${COINBASE_CONFIG.baseUrl}${path}`;
+  const bodyString = body ? JSON.stringify(body) : '';
+
+  try {
+    console.log('Signing JWT...');
+    const jwt = generateJWT(method, path);
+    console.log('JWT generated successfully');
+    console.log(`Coinbase: ${String(method || 'GET').toUpperCase()} ${path}`);
+
+    const options = {
+      method,
+      headers: {
+        Authorization: `Bearer ${jwt}`,
+        'Content-Type': 'application/json'
+      }
+    };
+
+    if (bodyString) options.body = bodyString;
+
+    const response = await fetch(url, options);
+    const text = await response.text();
+
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { raw: text };
+    }
+
+    if (!response.ok) {
+      console.error('Coinbase API Error:', { method, path, status: response.status, data });
+      return {
+        success: false,
+        error: data?.message || data?.error || `HTTP ${response.status}`,
+        status: response.status,
+        data
+      };
+    }
+
+    return { success: true, status: response.status, data };
+  } catch (error) {
+    console.error('Coinbase Request Failed:', { method, path, error: error.message });
+    return { success: false, error: error.message };
+  }
+}
+
+function normalizeAccount(acc) {
+  const available = parseFloat(
+    acc.available_balance?.value ??
+    acc.available ??
+    acc.balance?.available ??
+    0
+  );
+
+  const hold = parseFloat(
+    acc.hold?.value ??
+    acc.hold ??
+    acc.balance?.hold ??
+    0
+  );
+
+  return {
+    id: acc.uuid || acc.id || null,
+    currency: String(acc.currency || '').toUpperCase(),
+    available,
+    hold,
+    total: available + hold
+  };
+}
+
+async function getAccounts() {
+  const result = await coinbaseRequest('GET', '/api/v3/brokerage/accounts');
+  if (!result.success) return result;
+
+  const rawAccounts = Array.isArray(result.data?.accounts)
+    ? result.data.accounts
+    : Array.isArray(result.data)
+      ? result.data
+      : [];
+
+  if (!rawAccounts.length) {
+    console.error('[COINBASE] Accounts payload missing or empty', result.data);
+    return { success: false, error: 'coinbase_accounts_empty', data: result.data };
+  }
+
+  return rawAccounts.map(normalizeAccount);
+}
+
+async function getBalance(currency) {
+  const wanted = String(currency || '').toUpperCase();
+  const accounts = await getAccounts();
+
+  if (!Array.isArray(accounts)) {
+    return {
+      success: false,
+      error: accounts.error || 'coinbase_balance_lookup_failed',
+      data: accounts.data || null
+    };
+  }
+
+  const account = accounts.find((a) => a.currency === wanted);
+
+  if (!account) {
+    return {
+      success: false,
+      error: `coinbase_${wanted}_account_not_found`,
+      data: accounts
+    };
+  }
+
+  return account;
+}
+
+async function getUSDBalance() {
+  const usd = await getBalance('USD');
+
+  if (usd && usd.success === false) {
+    const usdc = await getBalance('USDC');
+    if (usdc && usdc.success === false) {
+      return {
+        success: false,
+        error: 'coinbase_balance_lookup_failed',
+        details: { usd_error: usd.error, usdc_error: usdc.error }
+      };
+    }
+    return usdc;
+  }
+
+  return usd;
+}
+
+async function getSpendableUsdBalance() {
+  const usdc = await getBalance('USDC');
+  if (usdc && usdc.success !== false) {
+    console.log('[COINBASE] Spendable quote balance selected', {
+      preferred_currency: 'USDC',
+      available: usdc.available,
+      hold: usdc.hold,
+      total: usdc.total
+    });
+    return usdc;
+  }
+
+  const usd = await getBalance('USD');
+  if (usd && usd.success !== false) {
+    console.log('[COINBASE] Spendable quote balance selected', {
+      preferred_currency: 'USD',
+      available: usd.available,
+      hold: usd.hold,
+      total: usd.total
+    });
+    return usd;
+  }
+
+  return {
+    success: false,
+    error: 'coinbase_balance_lookup_failed',
+    details: { usdc_error: usdc?.error || null, usd_error: usd?.error || null }
+  };
+}
+
+async function getPrice(productId) {
+  const result = await coinbaseRequest('GET', `/api/v3/brokerage/products/${productId}`);
+
+  if (result.success && result.data) {
+    return {
+      productId: result.data.product_id,
+      price: parseFloat(result.data.price),
+      bid: parseFloat(result.data.quote_min_size),
+      ask: parseFloat(result.data.quote_max_size),
+      volume24h: parseFloat(result.data.volume_24h)
+    };
+  }
+
+  return result;
+}
+
+async function getBestBidAsk(productId) {
+  const result = await coinbaseRequest('GET', `/api/v3/brokerage/best_bid_ask?product_ids=${productId}`);
+
+  if (result.success && result.data.pricebooks?.[0]) {
+    const book = result.data.pricebooks[0];
+    return {
+      productId: book.product_id,
+      bid: parseFloat(book.bids?.[0]?.price || 0),
+      ask: parseFloat(book.asks?.[0]?.price || 0),
+      spread: parseFloat(book.asks?.[0]?.price || 0) - parseFloat(book.bids?.[0]?.price || 0)
+    };
+  }
+
+  return result;
+}
+
+function extractBrokerOrderId(data) {
+  return (
+    data?.order_id ||
+    data?.success_response?.order_id ||
+    data?.orderId ||
+    null
   );
 }
 
-const { executeTrade } = loadCoinbaseExecution();
+async function placeMarketOrder(productId, side, amount, sizeType = 'quote') {
+  const clientOrderId = `CST_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  const orderConfig = { market_market_ioc: {} };
+
+  if (side.toUpperCase() === 'BUY') {
+    orderConfig.market_market_ioc.quote_size = String(amount);
+  } else if (sizeType === 'base') {
+    orderConfig.market_market_ioc.base_size = String(amount);
+  } else {
+    orderConfig.market_market_ioc.quote_size = String(amount);
+  }
+
+  const order = {
+    client_order_id: clientOrderId,
+    product_id: productId,
+    side: side.toUpperCase(),
+    order_configuration: orderConfig
+  };
+
+  console.log(`[COINBASE] Placing MARKET ${side} order`, { productId, amount, sizeType });
+
+  const result = await coinbaseRequest('POST', '/api/v3/brokerage/orders', order);
+
+  if (result.success) {
+    const brokerOrderId = extractBrokerOrderId(result.data);
+    const durableOrderId = brokerOrderId || clientOrderId;
+
+    console.log('[COINBASE] Order placed', {
+      productId,
+      brokerOrderId,
+      clientOrderId,
+      durableOrderId
+    });
+
+    return {
+      success: true,
+      accepted: true,
+      orderId: durableOrderId,
+      brokerOrderId,
+      clientOrderId,
+      status: result.data?.success_response?.status || 'PENDING',
+      data: result.data
+    };
+  }
+
+  console.error('[COINBASE] Order failed', { productId, error: result.error, data: result.data });
+  return result;
+}
+
+async function placeLimitOrder(productId, side, price, size) {
+  const clientOrderId = `CST_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+  const order = {
+    client_order_id: clientOrderId,
+    product_id: productId,
+    side: side.toUpperCase(),
+    order_configuration: {
+      limit_limit_gtc: {
+        base_size: size.toString(),
+        limit_price: price.toString(),
+        post_only: false
+      }
+    }
+  };
+
+  console.log(`[COINBASE] Placing LIMIT ${side} order`, { productId, price, size });
+
+  const result = await coinbaseRequest('POST', '/api/v3/brokerage/orders', order);
+
+  if (result.success) {
+    const brokerOrderId = extractBrokerOrderId(result.data);
+    return {
+      success: true,
+      accepted: true,
+      orderId: brokerOrderId || clientOrderId,
+      brokerOrderId,
+      clientOrderId,
+      status: 'PENDING',
+      data: result.data
+    };
+  }
+
+  return result;
+}
+
+async function placeStopOrder(productId, side, stopPrice, size) {
+  const clientOrderId = `CST_SL_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+  const order = {
+    client_order_id: clientOrderId,
+    product_id: productId,
+    side: side.toUpperCase(),
+    order_configuration: {
+      stop_limit_stop_limit_gtc: {
+        base_size: size.toString(),
+        limit_price: (stopPrice * 0.995).toString(),
+        stop_price: stopPrice.toString(),
+        stop_direction:
+          side.toUpperCase() === 'SELL'
+            ? 'STOP_DIRECTION_STOP_DOWN'
+            : 'STOP_DIRECTION_STOP_UP'
+      }
+    }
+  };
+
+  console.log(`[COINBASE] Placing STOP ${side} order`, { productId, stopPrice, size });
+
+  const result = await coinbaseRequest('POST', '/api/v3/brokerage/orders', order);
+
+  if (result.success) {
+    const brokerOrderId = extractBrokerOrderId(result.data);
+    return {
+      success: true,
+      accepted: true,
+      orderId: brokerOrderId || clientOrderId,
+      brokerOrderId,
+      clientOrderId,
+      type: 'STOP_LOSS',
+      stopPrice,
+      size,
+      data: result.data
+    };
+  }
+
+  return result;
+}
+
+async function cancelOrder(orderId) {
+  const result = await coinbaseRequest('POST', '/api/v3/brokerage/orders/batch_cancel', {
+    order_ids: [orderId]
+  });
+
+  if (result.success) console.log('[COINBASE] Order cancelled', { orderId });
+  return result;
+}
+
+async function getOrder(orderId) {
+  if (!orderId) {
+    return { success: false, error: 'coinbase_order_lookup_missing_order_id' };
+  }
+
+  const normalizedOrderId = String(orderId).trim();
+
+  if (normalizedOrderId.startsWith('CST_')) {
+    console.log('[COINBASE] Skipping historical lookup for clientOrderId', normalizedOrderId);
+    return {
+      success: true,
+      skipped: true,
+      orderId: normalizedOrderId,
+      brokerOrderId: null,
+      clientOrderId: normalizedOrderId,
+      status: 'FILLED',
+      filledSize: null,
+      filledValue: null,
+      averagePrice: null,
+      createdAt: null,
+      raw: null,
+      source: 'client_order_id_fallback'
+    };
+  }
+
+  const result = await coinbaseRequest('GET', `/api/v3/brokerage/orders/historical/${normalizedOrderId}`);
+
+  if (result.success && result.data.order) {
+    const order = result.data.order;
+    return {
+      success: true,
+      orderId: order.order_id,
+      productId: order.product_id,
+      side: order.side,
+      status: order.status,
+      filledSize: parseFloat(order.filled_size || 0),
+      filledValue: parseFloat(order.filled_value || 0),
+      averagePrice: parseFloat(order.average_filled_price || 0),
+      createdAt: order.created_time,
+      raw: order
+    };
+  }
+
+  return result;
+}
+
+async function getOrderBestEffort(orderId, retries = 2, delayMs = 750) {
+  if (!orderId) {
+    return { success: false, error: 'coinbase_order_lookup_missing_order_id' };
+  }
+
+  const normalizedOrderId = String(orderId).trim();
+
+  if (normalizedOrderId.startsWith('CST_')) {
+    return {
+      success: true,
+      skipped: true,
+      orderId: normalizedOrderId,
+      brokerOrderId: null,
+      clientOrderId: normalizedOrderId,
+      status: 'FILLED',
+      filledSize: null,
+      filledValue: null,
+      averagePrice: null,
+      createdAt: null,
+      raw: null,
+      source: 'client_order_id_fallback'
+    };
+  }
+
+  let last = null;
+  for (let i = 0; i <= retries; i++) {
+    last = await getOrder(normalizedOrderId);
+    if (last?.success) return last;
+    if (i < retries) await sleep(delayMs);
+  }
+  return last || { success: false, error: 'coinbase_order_lookup_failed' };
+}
+
+async function getOpenOrders() {
+  const result = await coinbaseRequest('GET', '/api/v3/brokerage/orders/historical/batch?order_status=OPEN');
+
+  if (result.success && result.data.orders) {
+    return result.data.orders.map(order => ({
+      orderId: order.order_id,
+      productId: order.product_id,
+      side: order.side,
+      status: order.status,
+      type: order.order_type,
+      size: parseFloat(order.size || order.base_size || 0),
+      price: parseFloat(order.price || order.limit_price || 0),
+      createdAt: order.created_time
+    }));
+  }
+
+  return [];
+}
+
+function normalizeSignalSide(side) {
+  const s = String(side || '').trim().toLowerCase();
+
+  if (s === 'buy' || s === 'long') return 'BUY';
+  if (s === 'sell' || s === 'short') return 'SELL';
+  if (s === 'close' || s === 'exit') return 'SELL';
+
+  return s.toUpperCase();
+}
+
+function normalizeCoinbaseSymbol(symbol) {
+  const raw = String(symbol || '').trim().toUpperCase();
+  if (!raw) return null;
+
+  if (raw.endsWith('C-USDC')) return raw.replace('C-USDC', '-USDC');
+  if (raw.endsWith('-USDC')) return raw;
+  if (raw.endsWith('USDC') && !raw.includes('-')) return raw.replace('USDC', '-USDC');
+  if (raw.endsWith('-USD')) return raw;
+
+  return raw;
+}
+
+function extractBaseCoin(productId) {
+  return String(productId || '').split('-')[0] || null;
+}
+
+function resolveUsdSize(signal) {
+  const candidates = [
+    signal?.size_usd,
+    signal?.amount_usd,
+    signal?.usdAmount,
+    signal?.size,
+    signal?.amount,
+    signal?.notional
+  ];
+
+  for (const value of candidates) {
+    const num = Number(value);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+
+  return 50;
+}
+
+function resolveBaseSize(signal) {
+  const candidates = [
+    signal?.base_size,
+    signal?.qty_base,
+    signal?.qty,
+    signal?.size_base
+  ];
+
+  for (const value of candidates) {
+    const num = Number(value);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+
+  return null;
+}
+
+function resolveReferencePrice(signal) {
+  const candidates = [
+    signal?.mark_price,
+    signal?.price,
+    signal?.entry_price,
+    signal?.avg_price
+  ];
+
+  for (const value of candidates) {
+    const num = Number(value);
+    if (Number.isFinite(num) && num > 0) return num;
+  }
+
+  return 0;
+}
+
+async function openPosition(productId, side, quoteAmount, stopLossPercent = 5, takeProfitPercent = 10) {
+  const normalizedProductId = normalizeCoinbaseSymbol(productId);
+  const baseCoin = extractBaseCoin(normalizedProductId);
+
+  console.log(`
+[COINBASE] OPENING POSITION ${side} ${normalizedProductId} with quote ${quoteAmount}`);
+
+  const balance = await getSpendableUsdBalance();
+  if (!balance || balance.success === false || balance.available == null) {
+    return {
+      success: false,
+      error: `Balance lookup failed: ${balance?.error || 'unknown_error'}`,
+      details: balance?.details || null,
+      data: balance?.data || null
+    };
+  }
+
+  console.log('[COINBASE] Spendable balance check', {
+    selected_currency: balance.currency,
+    available: balance.available,
+    requested_quote_amount: quoteAmount,
+    productId: normalizedProductId
+  });
+
+  if (!balance.available || balance.available < quoteAmount) {
+    return {
+      success: false,
+      error: `Insufficient live USD/USDC balance. Currency: ${balance.currency || 'UNKNOWN'}. Available: $${balance.available?.toFixed(2) || 0}. Requested: $${Number(quoteAmount || 0).toFixed(2)}`
+    };
+  }
+
+  const priceData = await getBestBidAsk(normalizedProductId);
+  if (!priceData.bid) {
+    return { success: false, error: `Could not get current price for ${normalizedProductId}` };
+  }
+
+  const entryPrice = side.toUpperCase() === 'BUY' ? priceData.ask : priceData.bid;
+
+  const marketOrder = await placeMarketOrder(normalizedProductId, side, quoteAmount, 'quote');
+  if (!marketOrder.success) {
+    return { success: false, error: `Market order failed: ${marketOrder.error}` };
+  }
+
+  let filledPrice = entryPrice;
+  let filledSize = quoteAmount / Math.max(entryPrice, 0.00000001);
+
+  if (marketOrder.brokerOrderId) {
+    const orderDetails = await getOrderBestEffort(marketOrder.brokerOrderId, 2, 750);
+    if (orderDetails?.success) {
+      filledPrice = Number(orderDetails.averagePrice || filledPrice);
+      filledSize = Number(orderDetails.filledSize || filledSize);
+    } else {
+      console.log('[COINBASE] BUY order accepted; details pending', {
+        productId: normalizedProductId,
+        orderId: marketOrder.orderId,
+        brokerOrderId: marketOrder.brokerOrderId,
+        clientOrderId: marketOrder.clientOrderId,
+        lookup_error: orderDetails?.error || null
+      });
+    }
+  } else {
+    console.log('[COINBASE] BUY order accepted without immediate broker order id', {
+      productId: normalizedProductId,
+      orderId: marketOrder.orderId,
+      clientOrderId: marketOrder.clientOrderId
+    });
+  }
+
+  const stopLossPrice = side.toUpperCase() === 'BUY'
+    ? filledPrice * (1 - stopLossPercent / 100)
+    : filledPrice * (1 + stopLossPercent / 100);
+
+  const takeProfitPrice = side.toUpperCase() === 'BUY'
+    ? filledPrice * (1 + takeProfitPercent / 100)
+    : filledPrice * (1 - takeProfitPercent / 100);
+
+  const stopSide = side.toUpperCase() === 'BUY' ? 'SELL' : 'BUY';
+  const stopOrder = await placeStopOrder(normalizedProductId, stopSide, stopLossPrice, filledSize);
+  const tpOrder = await placeLimitOrder(normalizedProductId, stopSide, takeProfitPrice, filledSize);
+
+  return {
+    success: true,
+    accepted: true,
+    id: `POS_${Date.now()}`,
+    coin: baseCoin,
+    productId: normalizedProductId,
+    side: side.toUpperCase(),
+    entryPrice: filledPrice,
+    size: filledSize,
+    usdValue: quoteAmount,
+    stopLoss: { price: stopLossPrice, orderId: stopOrder.orderId, percent: stopLossPercent },
+    takeProfit: { price: takeProfitPrice, orderId: tpOrder.orderId, percent: takeProfitPercent },
+    status: 'OPEN',
+    openedAt: new Date().toISOString(),
+    orderId: marketOrder.orderId,
+    brokerOrderId: marketOrder.brokerOrderId || null,
+    clientOrderId: marketOrder.clientOrderId || null,
+    fillQty: filledSize,
+    fillPrice: filledPrice,
+    exchange: 'coinbase',
+    detail: marketOrder.data || null,
+    orders: { entry: marketOrder, stopLoss: stopOrder, takeProfit: tpOrder }
+  };
+}
+
+async function closePosition(position, reason = 'MANUAL') {
+  const productId = normalizeCoinbaseSymbol(position.productId);
+  const closeSide = position.side === 'BUY' ? 'SELL' : 'BUY';
+
+  if (position.stopLoss?.orderId) await cancelOrder(position.stopLoss.orderId);
+  if (position.takeProfit?.orderId) await cancelOrder(position.takeProfit.orderId);
+
+  const closeSize = Number(position.size || 0);
+  if (!Number.isFinite(closeSize) || closeSize <= 0) {
+    return { success: false, error: 'Failed to close: invalid position.size for base close' };
+  }
+
+  const closeOrder = await placeMarketOrder(productId, closeSide, closeSize, 'base');
+  if (!closeOrder.success) {
+    return { success: false, error: `Failed to close: ${closeOrder.error}` };
+  }
+
+  let filledSize = closeSize;
+  let exitPrice = 0;
+  let detail = closeOrder.data || null;
+
+  if (closeOrder.brokerOrderId) {
+    const orderDetails = await getOrderBestEffort(closeOrder.brokerOrderId, 2, 750);
+    if (orderDetails?.success) {
+      filledSize = Number(orderDetails.filledSize || closeSize);
+      exitPrice = Number(orderDetails.averagePrice || 0);
+      detail = orderDetails.raw || orderDetails;
+    }
+  }
+
+  const pnl = position.side === 'BUY'
+    ? (exitPrice - position.entryPrice) * filledSize
+    : (position.entryPrice - exitPrice) * filledSize;
+
+  const pnlPercent = position.usdValue > 0 ? (pnl / position.usdValue) * 100 : 0;
+
+  return {
+    success: true,
+    accepted: true,
+    position,
+    orderId: closeOrder.orderId,
+    brokerOrderId: closeOrder.brokerOrderId || null,
+    clientOrderId: closeOrder.clientOrderId || null,
+    fillQty: filledSize,
+    fillPrice: exitPrice,
+    exchange: 'coinbase',
+    detail,
+    exitPrice,
+    pnl,
+    pnlPercent,
+    reason,
+    closedAt: new Date().toISOString()
+  };
+}
+
+async function executeTrade(signal) {
+  try {
+    console.log('[COINBASE EXECUTOR] Received signal', signal);
+
+    if (!signal || !signal.symbol || !signal.side) {
+      return { success: false, error: 'executeTrade_missing_signal_fields' };
+    }
+
+    const side = normalizeSignalSide(signal.side);
+    const productId = normalizeCoinbaseSymbol(signal.symbol);
+
+    if (!productId) {
+      return { success: false, error: 'executeTrade_invalid_product_mapping' };
+    }
+
+    if (side === 'BUY') {
+      const quoteAmount = resolveUsdSize(signal);
+      return await openPosition(productId, side, quoteAmount);
+    }
+
+    if (side === 'SELL') {
+      const baseCurrency = extractBaseCoin(productId);
+      const baseBalance = await getBalance(baseCurrency);
+
+      if (baseBalance?.success === false) {
+        return {
+          success: false,
+          error: `SELL rejected: failed to fetch ${baseCurrency} balance (${baseBalance.error || 'unknown'})`
+        };
+      }
+
+      const availableBaseRaw = Number(baseBalance.available || 0);
+
+      if (!Number.isFinite(availableBaseRaw) || availableBaseRaw <= 0) {
+        return {
+          success: false,
+          error: `SELL rejected: no available ${baseCurrency} balance`
+        };
+      }
+
+      const sellSize = roundBaseSize(availableBaseRaw * 0.999, 8);
+
+      if (!Number.isFinite(sellSize) || sellSize <= 0) {
+        return {
+          success: false,
+          error: `SELL rejected: computed sell size invalid`
+        };
+      }
+
+      console.log('[COINBASE EXECUTOR] SELL using BALANCE TRUTH', {
+        productId,
+        availableBaseRaw,
+        sellSize
+      });
+
+      const sellOrder = await placeMarketOrder(productId, 'SELL', sellSize, 'base');
+      if (!sellOrder.success) {
+        return sellOrder;
+      }
+
+      let fillQty = sellSize;
+      let fillPrice = resolveReferencePrice(signal);
+      let detail = sellOrder.data || null;
+      let pendingFill = true;
+
+      if (sellOrder.brokerOrderId) {
+        const orderDetails = await getOrderBestEffort(sellOrder.brokerOrderId, 2, 750);
+        if (orderDetails?.success) {
+          fillQty = Number(orderDetails.filledSize || sellSize);
+          fillPrice = Number(orderDetails.averagePrice || fillPrice || 0);
+          detail = orderDetails.raw || orderDetails;
+          pendingFill = false;
+        } else {
+          console.log('[COINBASE EXECUTOR] SELL accepted; order details pending', {
+            productId,
+            orderId: sellOrder.orderId,
+            brokerOrderId: sellOrder.brokerOrderId,
+            clientOrderId: sellOrder.clientOrderId,
+            lookup_error: orderDetails?.error || null
+          });
+        }
+      } else {
+        console.log('[COINBASE EXECUTOR] SELL accepted without immediate broker order id', {
+          productId,
+          orderId: sellOrder.orderId,
+          clientOrderId: sellOrder.clientOrderId
+        });
+      }
+
+      return {
+        success: true,
+        accepted: true,
+        pendingFill,
+        orderId: sellOrder.orderId,
+        brokerOrderId: sellOrder.brokerOrderId || null,
+        clientOrderId: sellOrder.clientOrderId || null,
+        fillQty,
+        fillPrice,
+        exchange: 'coinbase',
+        detail
+      };
+    }
+
+    return { success: false, error: `executeTrade_unsupported_side_${side}` };
+  } catch (error) {
+    console.error('[COINBASE EXECUTOR] executeTrade failed', error);
+    return { success: false, error: error?.message || 'executeTrade_unknown_error' };
+  }
+}
+
+function toProductId(coin) {
+  return `${String(coin || '').toUpperCase()}-USDC`;
+}
+
+function calculatePositionSize(accountBalance, riskPercent, entryPrice, stopLossPrice) {
+  const riskAmount = accountBalance * (riskPercent / 100);
+  const priceDiff = Math.abs(entryPrice - stopLossPrice);
+  const riskPerUnit = priceDiff;
+
+  if (riskPerUnit === 0) return 0;
+
+  const positionSize = riskAmount / riskPerUnit;
+  const positionValue = positionSize * entryPrice;
+
+  return { size: positionSize, value: positionValue, riskAmount, riskPercent };
+}
+
+
+
+  return { executeTrade };
+})();
 
 function nowIso() {
   return new Date().toISOString();
