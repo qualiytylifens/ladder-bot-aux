@@ -713,12 +713,27 @@ async function openPosition(productId, side, quoteAmount, stopLossPercent = 5, t
     });
   }
 
+  let entryPrice = 0;
+
   const priceData = await getBestBidAsk(normalizedProductId);
-  if (!priceData.bid) {
-    return { success: false, error: `Could not get current price for ${normalizedProductId}` };
+  if (priceData && Number(priceData.bid) > 0) {
+    entryPrice = side.toUpperCase() === 'BUY'
+      ? Number(priceData.ask || priceData.bid)
+      : Number(priceData.bid);
+  } else {
+    const productData = await getPrice(normalizedProductId);
+    if (productData && Number(productData.price) > 0) {
+      entryPrice = Number(productData.price);
+      console.warn('[COINBASE] best_bid_ask unavailable, using product price fallback', {
+        productId: normalizedProductId,
+        fallbackPrice: entryPrice
+      });
+    }
   }
 
-  const entryPrice = side.toUpperCase() === 'BUY' ? priceData.ask : priceData.bid;
+  if (!Number.isFinite(entryPrice) || entryPrice <= 0) {
+    return { success: false, error: `Could not get current price for ${normalizedProductId}` };
+  }
 
   const marketOrder = await placeMarketOrder(normalizedProductId, side, quoteAmount, 'quote');
   if (!marketOrder.success) {
