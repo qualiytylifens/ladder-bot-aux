@@ -1192,7 +1192,7 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 
 const hasSupabase = Boolean(SUPABASE_URL && SUPABASE_SERVICE_KEY);
 
-log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V3_DIRECT_RESOLVER' });
+log({ tag: TAG, msg: 'WORKER_VERSION_CHECK', ts: nowIso(), version: 'FIXED_POLICY_V4_LIVE_JOURNAL' });
 
 log({
   tag: TAG,
@@ -2099,6 +2099,13 @@ async function loop() {
           const mode = safeTrim(payload.execution_mode || payload.mode || raw.execution_mode || raw.mode).toLowerCase();
 
           if (action === 'buy' && mode === 'live') {
+            log({
+              tag: TAG,
+              msg: 'LIVE_ENTRY_JOURNAL_START',
+              ts: nowIso(),
+              job_id: claimed.id,
+              intent_id: claimed.intent_id
+            });
             await touchHeartbeat(claimed.id, 'live_entry_journal');
             ledger = await ensureLiveEntryJournalForJob({ job: claimed, result });
           } else {
