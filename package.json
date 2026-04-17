@@ -2,10 +2,11 @@
   "name": "ladder-bot-aux",
   "version": "1.0.1",
   "description": "Coin-Smart execution worker (Supabase job runner)",
-  "main": "worker.js",
+  "main": "direct_executor_settled_close.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node worker.js"
+    "start": "node direct_executor_settled_close.js",
+    "start:worker": "node worker.js"
   },
   "engines": {
     "node": "20.x"
