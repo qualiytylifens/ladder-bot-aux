@@ -13,14 +13,5 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1"
-  },
-  "keywords": [
-    "worker",
-    "execution",
-    "supabase",
-    "coin-smart",
-    "job-runner"
-  ],
-  "author": "Coin-Smart",
-  "license": "MIT"
+  }
 }
