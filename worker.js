@@ -17,6 +17,8 @@
 
 'use strict';
 
+console.log('[WORKER_VERSION]', 'WORKER_CLOSE_FIX_2026_04_21_A');
+
 const { createClient } = require('@supabase/supabase-js');
 
 function nowIso() {
