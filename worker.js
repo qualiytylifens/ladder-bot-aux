@@ -8,6 +8,11 @@
  *   execution_jobs -> worker -> ladder-bot /webhook/worker
  * - Preserve basic retry / heartbeat / completion behavior
  * - NEVER writes execution_jobs.updated_at
+ *
+ * Additional fixes in this version:
+ * - Fix the hole where thrown webhook/timeout errors left jobs stuck forever.
+ * - Use status='processing' consistently so it matches production semantics.
+ * - Add stale-processing requeue so hung jobs can recover.
  */
 
 'use strict';
@@ -66,6 +71,7 @@ function summarizeUnknownError(err) {
 }
 
 const TAG = 'AUX';
+const PROCESSING_STATUS = 'processing';
 const WORKER_ENABLED = envBool('WORKER_ENABLED', true);
 const WORKER_ID = process.env.WORKER_ID || 'ladder-worker-1';
 const TYPES = parseTypes(process.env.TYPES || process.env.WORKER_TYPES || 'execute_intent');
@@ -74,6 +80,11 @@ const JOB_TIMEOUT_MS = envInt('JOB_TIMEOUT_MS', 60000);
 const JOB_HEARTBEAT_MS = envInt('JOB_HEARTBEAT_MS', 15000);
 const MAX_ATTEMPTS = envInt('MAX_ATTEMPTS', 3);
 const RETRY_BACKOFF_MS = envInt('RETRY_BACKOFF_MS', 5000);
+const STALE_PROCESSING_MS = envInt(
+  'STALE_PROCESSING_MS',
+  Math.max(JOB_TIMEOUT_MS + JOB_HEARTBEAT_MS + 5000, 90000)
+);
+const STALE_SCAN_EVERY_LOOPS = envInt('STALE_SCAN_EVERY_LOOPS', 15);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -107,8 +118,10 @@ log({
   JOB_HEARTBEAT_MS,
   MAX_ATTEMPTS,
   RETRY_BACKOFF_MS,
+  STALE_PROCESSING_MS,
   webhook_url_prefix: WORKER_WEBHOOK_URL.slice(0, 80),
   schema_safe_no_updated_at: true,
+  processing_status: PROCESSING_STATUS,
 });
 
 if (!WORKER_ENABLED) {
@@ -126,7 +139,7 @@ async function touchHeartbeat(jobId, step = 'processing') {
     })
     .eq('id', jobId)
     .eq('claimed_by', WORKER_ID)
-    .eq('status', 'running');
+    .eq('status', PROCESSING_STATUS);
 
   if (error) throw error;
 }
@@ -168,7 +181,7 @@ async function claimJob(jobId) {
   const { data, error } = await sb
     .from('execution_jobs')
     .update({
-      status: 'running',
+      status: PROCESSING_STATUS,
       claimed_by: WORKER_ID,
       claimed_at: now,
       heartbeat_at: now,
@@ -201,7 +214,7 @@ async function completeJob(jobId) {
   if (error) throw error;
 }
 
-async function markFailedDeadletter(jobId, lastErrorCode) {
+async function markFailedDeadletter(jobId, lastErrorCode, detail = null) {
   const now = nowIso();
   const { error } = await sb
     .from('execution_jobs')
@@ -209,7 +222,7 @@ async function markFailedDeadletter(jobId, lastErrorCode) {
       status: 'failed',
       heartbeat_at: now,
       last_step: 'failed_deadletter',
-      last_error: lastErrorCode || 'deadletter_max_attempts',
+      last_error: detail ? JSON.stringify({ code: lastErrorCode || 'deadletter_max_attempts', detail }) : (lastErrorCode || 'deadletter_max_attempts'),
     })
     .eq('id', jobId)
     .eq('claimed_by', WORKER_ID);
@@ -217,7 +230,7 @@ async function markFailedDeadletter(jobId, lastErrorCode) {
   if (error) throw error;
 }
 
-async function requeueWithBackoff(job, lastErrorCode) {
+async function requeueWithBackoff(job, lastErrorCode, detail = null) {
   const now = new Date();
   const backoffMs = msBackoff(RETRY_BACKOFF_MS, job.attempts);
   const nextRunAt = new Date(now.getTime() + backoffMs).toISOString();
@@ -231,7 +244,7 @@ async function requeueWithBackoff(job, lastErrorCode) {
       claimed_at: null,
       heartbeat_at: now.toISOString(),
       last_step: `retry_queued_${nextAttempts}`,
-      last_error: lastErrorCode || 'retry',
+      last_error: detail ? JSON.stringify({ code: lastErrorCode || 'retry', detail }) : (lastErrorCode || 'retry'),
       attempts: nextAttempts,
       run_at: nextRunAt,
     })
@@ -248,6 +261,7 @@ async function requeueWithBackoff(job, lastErrorCode) {
     attempt: nextAttempts,
     next_run_at: nextRunAt,
     last_error: lastErrorCode,
+    detail,
   });
 }
 
@@ -324,9 +338,183 @@ async function executeViaWebhook(job) {
   };
 }
 
+async function reapStaleProcessingJobs() {
+  try {
+    const cutoffIso = new Date(Date.now() - STALE_PROCESSING_MS).toISOString();
+    const { data, error } = await sb
+      .from('execution_jobs')
+      .select('id, attempts, claimed_by, heartbeat_at, claimed_at, type, intent_id')
+      .eq('status', PROCESSING_STATUS)
+      .not('claimed_by', 'is', null)
+      .or(`heartbeat_at.lt.${cutoffIso},and(heartbeat_at.is.null,claimed_at.lt.${cutoffIso})`)
+      .limit(25);
+
+    if (error) throw error;
+    const rows = Array.isArray(data) ? data : [];
+    if (!rows.length) return;
+
+    for (const row of rows) {
+      const attempts = Number(row.attempts || 0);
+      if (attempts + 1 >= MAX_ATTEMPTS) {
+        const { error: deadErr } = await sb
+          .from('execution_jobs')
+          .update({
+            status: 'failed',
+            heartbeat_at: nowIso(),
+            last_step: 'failed_stale_processing_deadletter',
+            last_error: 'stale_processing_deadletter',
+          })
+          .eq('id', row.id)
+          .eq('status', PROCESSING_STATUS);
+        if (deadErr) throw deadErr;
+
+        log({
+          tag: TAG,
+          msg: 'STALE_JOB_DEADLETTERED',
+          ts: nowIso(),
+          id: row.id,
+          intent_id: row.intent_id,
+          claimed_by: row.claimed_by,
+        });
+      } else {
+        const nextAttempts = attempts + 1;
+        const nextRunAt = new Date(Date.now() + msBackoff(RETRY_BACKOFF_MS, attempts)).toISOString();
+        const { error: rqErr } = await sb
+          .from('execution_jobs')
+          .update({
+            status: 'queued',
+            claimed_by: null,
+            claimed_at: null,
+            heartbeat_at: nowIso(),
+            last_step: `stale_requeued_${nextAttempts}`,
+            last_error: 'stale_processing_requeued',
+            attempts: nextAttempts,
+            run_at: nextRunAt,
+          })
+          .eq('id', row.id)
+          .eq('status', PROCESSING_STATUS);
+        if (rqErr) throw rqErr;
+
+        log({
+          tag: TAG,
+          msg: 'STALE_JOB_REQUEUED',
+          ts: nowIso(),
+          id: row.id,
+          intent_id: row.intent_id,
+          claimed_by: row.claimed_by,
+          attempt: nextAttempts,
+          next_run_at: nextRunAt,
+        });
+      }
+    }
+  } catch (err) {
+    log({
+      tag: TAG,
+      msg: 'STALE_SCAN_ERROR',
+      ts: nowIso(),
+      ...summarizeUnknownError(err),
+    });
+  }
+}
+
+async function processClaimedJob(claimed) {
+  const stopHeartbeat = startHeartbeat(claimed.id);
+  try {
+    const result = await executeViaWebhook(claimed);
+
+    if (result.ok) {
+      await touchHeartbeat(claimed.id, 'finalizing');
+      await completeJob(claimed.id);
+      log({
+        tag: TAG,
+        msg: 'JOB_COMPLETED',
+        ts: nowIso(),
+        id: claimed.id,
+        type: claimed.type,
+        intent_id: claimed.intent_id,
+        path: 'webhook_truth_schema_safe',
+      });
+      return;
+    }
+
+    const attempts = Number(claimed.attempts || 0);
+    if (attempts + 1 >= MAX_ATTEMPTS) {
+      await markFailedDeadletter(claimed.id, result.code, result.detail);
+      log({
+        tag: TAG,
+        msg: 'JOB_DEADLETTERED',
+        ts: nowIso(),
+        id: claimed.id,
+        intent_id: claimed.intent_id,
+        last_error: result.code,
+        detail: result.detail,
+      });
+      return;
+    }
+
+    await requeueWithBackoff(claimed, result.code, result.detail);
+    log({
+      tag: TAG,
+      msg: 'JOB_WEBHOOK_FAILED_RETRYING',
+      ts: nowIso(),
+      id: claimed.id,
+      intent_id: claimed.intent_id,
+      last_error: result.code,
+      detail: result.detail,
+    });
+  } catch (err) {
+    const attempts = Number(claimed.attempts || 0);
+    const summary = summarizeUnknownError(err);
+    const timeoutLike =
+      summary.error_name === 'AbortError' ||
+      /aborted|timeout/i.test(summary.error_message || '');
+
+    if (attempts + 1 >= MAX_ATTEMPTS) {
+      await markFailedDeadletter(
+        claimed.id,
+        timeoutLike ? 'webhook_timeout' : 'webhook_exception',
+        summary
+      );
+      log({
+        tag: TAG,
+        msg: 'JOB_EXCEPTION_DEADLETTERED',
+        ts: nowIso(),
+        id: claimed.id,
+        intent_id: claimed.intent_id,
+        timeout_like: timeoutLike,
+        ...summary,
+      });
+      return;
+    }
+
+    await requeueWithBackoff(
+      claimed,
+      timeoutLike ? 'webhook_timeout' : 'webhook_exception',
+      summary
+    );
+    log({
+      tag: TAG,
+      msg: 'JOB_EXCEPTION_REQUEUED',
+      ts: nowIso(),
+      id: claimed.id,
+      intent_id: claimed.intent_id,
+      timeout_like: timeoutLike,
+      ...summary,
+    });
+  } finally {
+    stopHeartbeat();
+  }
+}
+
 async function loop() {
+  let loopCount = 0;
   while (true) {
     try {
+      loopCount += 1;
+      if (loopCount % Math.max(1, STALE_SCAN_EVERY_LOOPS) === 0) {
+        await reapStaleProcessingJobs();
+      }
+
       const candidate = await pickQueuedJob(TYPES);
       if (!candidate) {
         await sleep(POLL_MS);
@@ -349,53 +537,7 @@ async function loop() {
         attempts: claimed.attempts,
       });
 
-      const stopHeartbeat = startHeartbeat(claimed.id);
-
-      try {
-        const result = await executeViaWebhook(claimed);
-
-        if (result.ok) {
-          await touchHeartbeat(claimed.id, 'finalizing');
-          await completeJob(claimed.id);
-          log({
-            tag: TAG,
-            msg: 'JOB_COMPLETED',
-            ts: nowIso(),
-            id: claimed.id,
-            type: claimed.type,
-            intent_id: claimed.intent_id,
-            path: 'webhook_truth_schema_safe',
-          });
-        } else {
-          const attempts = Number(claimed.attempts || 0);
-          if (attempts + 1 >= MAX_ATTEMPTS) {
-            await markFailedDeadletter(claimed.id, result.code);
-            log({
-              tag: TAG,
-              msg: 'JOB_DEADLETTERED',
-              ts: nowIso(),
-              id: claimed.id,
-              intent_id: claimed.intent_id,
-              last_error: result.code,
-              detail: result.detail,
-            });
-          } else {
-            await requeueWithBackoff(claimed, result.code);
-            log({
-              tag: TAG,
-              msg: 'JOB_WEBHOOK_FAILED_RETRYING',
-              ts: nowIso(),
-              id: claimed.id,
-              intent_id: claimed.intent_id,
-              last_error: result.code,
-              detail: result.detail,
-            });
-          }
-        }
-      } finally {
-        stopHeartbeat();
-      }
-
+      await processClaimedJob(claimed);
       await sleep(250);
     } catch (err) {
       log({
