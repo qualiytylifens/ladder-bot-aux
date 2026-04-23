@@ -1,19 +1,11 @@
 /**
- * worker_crashfix_schema_safe.js
+ * direct_executor_settled_close.js
  *
  * Purpose:
- * - Fix the worker crash caused by writing execution_jobs.updated_at
- *   when that column does not exist in production.
- * - Keep the proven webhook-truth path:
- *   execution_jobs -> worker -> ladder-bot /webhook/worker
- * - Preserve basic retry / heartbeat / completion behavior
- * - NEVER writes execution_jobs.updated_at
- *
- * Additional fixes in this version:
- * - Fix the hole where thrown webhook/timeout errors left jobs stuck forever.
- * - Use status='processing' consistently so it matches production semantics.
- * - Add stale-processing requeue so hung jobs can recover.
- * - Add transient Supabase retry handling for 502/503/504 / Cloudflare HTML host errors.
+ * - Schema-safe executor for execution_jobs without writing updated_at.
+ * - Webhook-truth path:
+ *   execution_jobs -> direct-executor -> ladder-bot /webhook/worker
+ * - Hardened against stuck processing jobs and transient Supabase 502/503/504 errors.
  */
 
 'use strict';
@@ -155,7 +147,7 @@ const PROCESSING_STATUS = 'processing';
 const WORKER_ENABLED = envBool('WORKER_ENABLED', true);
 const WORKER_ID = process.env.WORKER_ID || 'ladder-worker-1';
 const TYPES = parseTypes(process.env.TYPES || process.env.WORKER_TYPES || 'execute_intent');
-const POLL_MS = envInt('POLL_MS', 2000);
+const POLL_MS = envInt('POLL_MS', 3000);
 const JOB_TIMEOUT_MS = envInt('JOB_TIMEOUT_MS', 60000);
 const JOB_HEARTBEAT_MS = envInt('JOB_HEARTBEAT_MS', 15000);
 const MAX_ATTEMPTS = envInt('MAX_ATTEMPTS', 3);
