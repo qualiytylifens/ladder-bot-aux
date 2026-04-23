@@ -13,11 +13,12 @@
  * - Fix the hole where thrown webhook/timeout errors left jobs stuck forever.
  * - Use status='processing' consistently so it matches production semantics.
  * - Add stale-processing requeue so hung jobs can recover.
+ * - Add transient Supabase retry handling for 502/503/504 / Cloudflare HTML host errors.
  */
 
 'use strict';
 
-console.log('[WORKER_VERSION]', 'WORKER_CLOSE_FIX_2026_04_21_A');
+console.log('[WORKER_VERSION]', 'WORKER_CLOSE_FIX_2026_04_21_B');
 
 const { createClient } = require('@supabase/supabase-js');
 
@@ -69,6 +70,83 @@ function summarizeUnknownError(err) {
     error_details: err && err.details ? err.details : null,
     error_hint: err && err.hint ? err.hint : null,
     error_stack: err && err.stack ? err.stack : null,
+    status: err && err.status ? err.status : null,
+  };
+}
+function isHtmlBody(s) {
+  const t = String(s || '').trim().toLowerCase();
+  return t.startsWith('<!doctype html') || t.startsWith('<html') || t.includes('<body>') || t.includes('cloudflare');
+}
+function isTransientInfraError(err) {
+  const msg = String(err?.message || '').toLowerCase();
+  const details = String(err?.details || '').toLowerCase();
+  const hint = String(err?.hint || '').toLowerCase();
+  const stack = String(err?.stack || '').toLowerCase();
+  const code = String(err?.code || '').toLowerCase();
+  const status = Number(err?.status || 0);
+
+  if ([408, 429, 500, 502, 503, 504, 520, 522, 524].includes(status)) return true;
+  if (['ecconnreset', 'etimedout', 'eai_again', 'enotfound', 'fetch_failed'].includes(code)) return true;
+
+  const blob = [msg, details, hint, stack].join(' | ');
+  return (
+    /502 bad gateway/.test(blob) ||
+    /503 service unavailable/.test(blob) ||
+    /504 gateway timeout/.test(blob) ||
+    /cloudflare/.test(blob) ||
+    /host error/.test(blob) ||
+    /bad gateway/.test(blob) ||
+    /gateway timeout/.test(blob) ||
+    /network error/.test(blob) ||
+    /fetch failed/.test(blob) ||
+    /socket hang up/.test(blob) ||
+    /connection reset/.test(blob) ||
+    /timed out/.test(blob) ||
+    isHtmlBody(blob)
+  );
+}
+function buildFetchWithSupabaseRetry(baseFetch, maxRetries, retryMs) {
+  return async (url, options = {}) => {
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      try {
+        const res = await baseFetch(url, options);
+        const status = Number(res?.status || 0);
+        if ([429, 500, 502, 503, 504, 520, 522, 524].includes(status)) {
+          const clone = res.clone();
+          const bodyText = await clone.text().catch(() => '');
+          if (attempt <= maxRetries) {
+            log({
+              tag: 'AUX',
+              msg: 'SUPABASE_HTTP_RETRY',
+              ts: nowIso(),
+              attempt,
+              status,
+              url: String(url).slice(0, 140),
+              body_preview: String(bodyText).slice(0, 220),
+            });
+            await sleep(retryMs * attempt);
+            continue;
+          }
+        }
+        return res;
+      } catch (err) {
+        if (attempt <= maxRetries && isTransientInfraError(err)) {
+          log({
+            tag: 'AUX',
+            msg: 'SUPABASE_FETCH_RETRY',
+            ts: nowIso(),
+            attempt,
+            url: String(url).slice(0, 140),
+            ...summarizeUnknownError(err),
+          });
+          await sleep(retryMs * attempt);
+          continue;
+        }
+        throw err;
+      }
+    }
   };
 }
 
@@ -87,6 +165,8 @@ const STALE_PROCESSING_MS = envInt(
   Math.max(JOB_TIMEOUT_MS + JOB_HEARTBEAT_MS + 5000, 90000)
 );
 const STALE_SCAN_EVERY_LOOPS = envInt('STALE_SCAN_EVERY_LOOPS', 15);
+const SUPABASE_FETCH_RETRIES = envInt('SUPABASE_FETCH_RETRIES', 3);
+const SUPABASE_FETCH_RETRY_MS = envInt('SUPABASE_FETCH_RETRY_MS', 1500);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
@@ -104,8 +184,11 @@ if (!WORKER_WEBHOOK_URL) {
   process.exit(1);
 }
 
+const fetchWithSupabaseRetry = buildFetchWithSupabaseRetry(fetch, SUPABASE_FETCH_RETRIES, SUPABASE_FETCH_RETRY_MS);
+
 const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
+  global: { fetch: fetchWithSupabaseRetry },
 });
 
 log({
@@ -121,6 +204,8 @@ log({
   MAX_ATTEMPTS,
   RETRY_BACKOFF_MS,
   STALE_PROCESSING_MS,
+  SUPABASE_FETCH_RETRIES,
+  SUPABASE_FETCH_RETRY_MS,
   webhook_url_prefix: WORKER_WEBHOOK_URL.slice(0, 80),
   schema_safe_no_updated_at: true,
   processing_status: PROCESSING_STATUS,
