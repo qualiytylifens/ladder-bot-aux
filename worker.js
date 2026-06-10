@@ -13,6 +13,7 @@
 console.log('[WORKER_VERSION]', 'WORKER_CLOSE_FIX_2026_04_21_B');
 
 const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 
 function nowIso() {
   return new Date().toISOString();
@@ -181,6 +182,9 @@ const fetchWithSupabaseRetry = buildFetchWithSupabaseRetry(fetch, SUPABASE_FETCH
 const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
   auth: { persistSession: false, autoRefreshToken: false },
   global: { fetch: fetchWithSupabaseRetry },
+  realtime: {
+    transport: WebSocket,
+  },
 });
 
 log({
