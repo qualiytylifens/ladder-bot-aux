@@ -28,6 +28,7 @@
 'use strict';
 
 const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
 
 if (typeof fetch !== 'function') {
   throw new Error('Global fetch is not available in this Node runtime');
@@ -58,7 +59,10 @@ if (!WEBHOOK_URL) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false }
+  auth: { persistSession: false, autoRefreshToken: false },
+  realtime: {
+    transport: WebSocket
+  }
 });
 
 console.log('[DIRECT_EXECUTOR_CLOSE_RECOVERY_V1]', {
@@ -92,7 +96,7 @@ function safeJson(value) {
 function truncate(value, max = 2000) {
   if (value == null) return value;
   const s = typeof value === 'string' ? value : safeJson(value);
-  return s.length > max ? `${s.slice(0, max)}…[truncated]` : s;
+  return s.length > max ? `${s.slice(0, max)}â¦[truncated]` : s;
 }
 
 function lower(value) {
