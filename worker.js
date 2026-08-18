@@ -144,6 +144,7 @@ function buildFetchWithSupabaseRetry(baseFetch, maxRetries, retryMs) {
 }
 
 const TAG = 'AUX';
+console.log('[WORKER_11_PATCH]', 'TERMINAL_NO_EXECUTION_CLASSIFICATION_AND_DURABLE_RELEASE_V1');
 const PROCESSING_STATUS = 'processing';
 const WORKER_ENABLED = envBool('WORKER_ENABLED', true);
 const WORKER_ID = process.env.WORKER_ID || 'ladder-worker-1';
@@ -500,6 +501,108 @@ async function reapStaleProcessingJobs() {
   }
 }
 
+function extractWebhookBusinessError(result) {
+  const response = result?.response && typeof result.response === 'object' ? result.response : {};
+  const nested = response?.detail && typeof response.detail === 'object' ? response.detail : {};
+  return safeTrim(
+    response.error ||
+    response.reason ||
+    nested.error ||
+    nested.reason ||
+    result?.code ||
+    ''
+  );
+}
+
+function isDeterministicTerminalNoExecution(result) {
+  const response = result?.response && typeof result.response === 'object' ? result.response : {};
+  const nested = response?.detail && typeof response.detail === 'object' ? response.detail : {};
+  const businessError = extractWebhookBusinessError(result);
+  const blob = [
+    businessError,
+    response?.error,
+    response?.reason,
+    nested?.error,
+    nested?.reason,
+    result?.detail,
+  ].map((v) => String(v || '')).join(' | ').toLowerCase();
+
+  if (response?.retryable === false || nested?.retryable === false) return true;
+
+  const deterministicCodes = new Set([
+    'DERIVATIVES_MICRO_LIVE_NOTIONAL_CAP_EXCEEDED',
+    'DERIVATIVES_CONTRACT_SIZING_METADATA_REQUIRED',
+    'DERIVATIVES_ESTIMATED_NOTIONAL_INVALID',
+    'COINBASE_DOMESTIC_DERIVATIVES_PRODUCT_REQUIRED_FOR_ACCOUNT',
+    'LIVE_DERIVATIVES_INSUFFICIENT_BUDGET_FOR_BROKER_POST',
+    'KILL_SWITCH_ACTIVE',
+  ]);
+
+  if (deterministicCodes.has(businessError)) return true;
+  if (/user does not have the correct permissions/.test(blob)) return true;
+
+  // Never automatically resend after ambiguous broker submission truth.
+  if (/live_derivatives_broker_submission_ambiguous/.test(blob)) return true;
+
+  return false;
+}
+
+async function releaseDurableTerminalOwnerAfterResponse(jobId) {
+  try {
+    const { data: rows, error: readErr } = await sb
+      .from('execution_jobs')
+      .select('broker_owner_token,broker_submit_state')
+      .eq('id', jobId)
+      .limit(1);
+    if (readErr) throw readErr;
+
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row?.broker_owner_token || row?.broker_submit_state !== 'terminal_not_submitted') {
+      return false;
+    }
+
+    const { data: released, error: releaseErr } = await sb.rpc(
+      'release_live_derivatives_terminal_owner_v1',
+      {
+        p_job_id: jobId,
+        p_owner_token: row.broker_owner_token,
+      }
+    );
+    if (releaseErr) throw releaseErr;
+    return released === true;
+  } catch (err) {
+    log({
+      tag: TAG,
+      msg: 'DURABLE_TERMINAL_OWNER_RELEASE_ERROR',
+      ts: nowIso(),
+      job_id: jobId,
+      ...summarizeUnknownError(err),
+    });
+    return false;
+  }
+}
+
+async function completeTerminalNoExecution(jobId, businessError, detail = null) {
+  const now = nowIso();
+  const { error } = await sb
+    .from('execution_jobs')
+    .update({
+      status: 'completed',
+      heartbeat_at: now,
+      last_step: 'completed_terminal_no_execution',
+      last_error: JSON.stringify({
+        code: businessError || 'terminal_no_execution',
+        detail,
+        broker_order_submitted: false,
+        retryable: false,
+      }),
+    })
+    .eq('id', jobId)
+    .eq('claimed_by', WORKER_ID);
+
+  if (error) throw error;
+}
+
 async function processClaimedJob(claimed) {
   const stopHeartbeat = startHeartbeat(claimed.id);
   try {
@@ -516,6 +619,26 @@ async function processClaimedJob(claimed) {
         type: claimed.type,
         intent_id: claimed.intent_id,
         path: 'webhook_truth_schema_safe',
+      });
+      return;
+    }
+
+    const businessError = extractWebhookBusinessError(result);
+
+    if (isDeterministicTerminalNoExecution(result)) {
+      const durableReleased = await releaseDurableTerminalOwnerAfterResponse(claimed.id);
+      await completeTerminalNoExecution(claimed.id, businessError, result.detail);
+      log({
+        tag: TAG,
+        msg: 'JOB_COMPLETED_TERMINAL_NO_EXECUTION',
+        ts: nowIso(),
+        id: claimed.id,
+        intent_id: claimed.intent_id,
+        business_error: businessError,
+        http_status: result.http_status,
+        durable_terminal_owner_released: durableReleased,
+        broker_order_submitted: false,
+        retryable: false,
       });
       return;
     }
