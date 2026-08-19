@@ -150,6 +150,11 @@ const WORKER_ENABLED = envBool('WORKER_ENABLED', true);
 const WORKER_ID = process.env.WORKER_ID || 'ladder-worker-1';
 const TYPES = parseTypes(process.env.TYPES || process.env.WORKER_TYPES || 'execute_intent');
 const POLL_MS = envInt('POLL_MS', 3000);
+// EXECUTION_SPEED_V1: bounded parallel job processing to prevent one slow
+// webhook from blocking every queued entry/exit behind it. Atomic DB claim
+// semantics remain authoritative, so concurrency does not bypass dedupe or
+// ownership controls. Default 2; hard-clamped to 1..8.
+const WORKER_CONCURRENCY = Math.max(1, Math.min(8, envInt('WORKER_CONCURRENCY', 2)));
 const JOB_TIMEOUT_MS = envInt('JOB_TIMEOUT_MS', 60000);
 const JOB_HEARTBEAT_MS = envInt('JOB_HEARTBEAT_MS', 15000);
 const MAX_ATTEMPTS = envInt('MAX_ATTEMPTS', 3);
@@ -196,6 +201,7 @@ log({
   WORKER_ID,
   TYPES,
   POLL_MS,
+  WORKER_CONCURRENCY,
   JOB_TIMEOUT_MS,
   JOB_HEARTBEAT_MS,
   MAX_ATTEMPTS,
@@ -712,12 +718,27 @@ async function processClaimedJob(claimed) {
   }
 }
 
-async function loop() {
+async function workerSlotLoop(slotIndex) {
   let loopCount = 0;
+
+  log({
+    tag: TAG,
+    msg: 'WORKER_SLOT_STARTED',
+    ts: nowIso(),
+    slot_index: slotIndex,
+    worker_concurrency: WORKER_CONCURRENCY,
+  });
+
   while (true) {
     try {
       loopCount += 1;
-      if (loopCount % Math.max(1, STALE_SCAN_EVERY_LOOPS) === 0) {
+
+      // Only slot 0 runs the stale-processing reaper so concurrency does not
+      // multiply recovery scans or alter existing recovery semantics.
+      if (
+        slotIndex === 0 &&
+        loopCount % Math.max(1, STALE_SCAN_EVERY_LOOPS) === 0
+      ) {
         await reapStaleProcessingJobs();
       }
 
@@ -729,7 +750,9 @@ async function loop() {
 
       const claimed = await claimJob(candidate.id);
       if (!claimed) {
-        await sleep(250);
+        // Another slot/replica may have atomically claimed the same candidate
+        // after our read. The existing conditional UPDATE remains the lock.
+        await sleep(100);
         continue;
       }
 
@@ -741,15 +764,20 @@ async function loop() {
         type: claimed.type,
         intent_id: claimed.intent_id,
         attempts: claimed.attempts,
+        slot_index: slotIndex,
       });
 
+      // Each slot remains serial internally, but multiple slots run in
+      // parallel. One slow webhook can therefore no longer block the entire
+      // execution queue.
       await processClaimedJob(claimed);
-      await sleep(250);
+      await sleep(100);
     } catch (err) {
       log({
         tag: TAG,
         msg: 'LOOP_ERROR',
         ts: nowIso(),
+        slot_index: slotIndex,
         ...summarizeUnknownError(err),
       });
       await sleep(Math.max(1000, POLL_MS));
@@ -757,4 +785,21 @@ async function loop() {
   }
 }
 
-loop();
+console.log('[WORKER_11_EXECUTION_SPEED_V1]', {
+  worker_concurrency: WORKER_CONCURRENCY,
+  poll_ms: POLL_MS,
+  job_timeout_ms: JOB_TIMEOUT_MS,
+});
+
+for (let slotIndex = 0; slotIndex < WORKER_CONCURRENCY; slotIndex += 1) {
+  workerSlotLoop(slotIndex).catch((err) => {
+    log({
+      tag: TAG,
+      msg: 'WORKER_SLOT_FATAL',
+      ts: nowIso(),
+      slot_index: slotIndex,
+      ...summarizeUnknownError(err),
+    });
+    process.exitCode = 1;
+  });
+}
