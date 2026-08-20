@@ -542,9 +542,16 @@ function isDeterministicTerminalNoExecution(result) {
     'COINBASE_DOMESTIC_DERIVATIVES_PRODUCT_REQUIRED_FOR_ACCOUNT',
     'LIVE_DERIVATIVES_INSUFFICIENT_BUDGET_FOR_BROKER_POST',
     'KILL_SWITCH_ACTIVE',
+    'blocked_live_execution_posture_not_deploy',
+    'blocked_live_final_policy_not_allow',
+    'blocked_live_probe_only_signal',
+    'live_max_open_trades_reached',
   ]);
 
-  if (deterministicCodes.has(businessError)) return true;
+  if (
+    deterministicCodes.has(businessError) ||
+    deterministicCodes.has(String(businessError || '').trim().toLowerCase())
+  ) return true;
   if (/user does not have the correct permissions/.test(blob)) return true;
 
   // Never automatically resend after ambiguous broker submission truth.
@@ -733,8 +740,6 @@ async function workerSlotLoop(slotIndex) {
     try {
       loopCount += 1;
 
-      // Only slot 0 runs the stale-processing reaper so concurrency does not
-      // multiply recovery scans or alter existing recovery semantics.
       if (
         slotIndex === 0 &&
         loopCount % Math.max(1, STALE_SCAN_EVERY_LOOPS) === 0
@@ -750,8 +755,6 @@ async function workerSlotLoop(slotIndex) {
 
       const claimed = await claimJob(candidate.id);
       if (!claimed) {
-        // Another slot/replica may have atomically claimed the same candidate
-        // after our read. The existing conditional UPDATE remains the lock.
         await sleep(100);
         continue;
       }
@@ -767,9 +770,6 @@ async function workerSlotLoop(slotIndex) {
         slot_index: slotIndex,
       });
 
-      // Each slot remains serial internally, but multiple slots run in
-      // parallel. One slow webhook can therefore no longer block the entire
-      // execution queue.
       await processClaimedJob(claimed);
       await sleep(100);
     } catch (err) {
