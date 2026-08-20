@@ -546,6 +546,9 @@ function isDeterministicTerminalNoExecution(result) {
     'blocked_live_final_policy_not_allow',
     'blocked_live_probe_only_signal',
     'live_max_open_trades_reached',
+    'insufficient_live_quote_balance',
+    'insufficient_live_cde_risk_capital',
+    'cde_capital_risk_budget_required',
   ]);
 
   if (
